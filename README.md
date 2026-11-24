@@ -352,7 +352,3 @@ FundChain/
 
 ---
 
-## 14. Academic Declaration
-
-This project was developed for **College Blockchain Technology Mini-Project #6**.  
-*All rights reserved.*
