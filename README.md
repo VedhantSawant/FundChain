@@ -1,7 +1,6 @@
 # FundChain: Decentralized Crowdfunding Platform with Refund Mechanism
 
 > **Official Project Title:** Decentralized Crowdfunding Platform with Refund Mechanism  
-> **Project Number:** 6  
 > **Course:** Blockchain Technology Mini-Project  
 > **Application Name:** FundChain  
 > **Tagline:** *Transparent Fundraising. Powered by Blockchain.*
