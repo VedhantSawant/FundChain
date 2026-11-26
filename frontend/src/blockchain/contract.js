@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import CrowdfundingABI from "./CrowdfundingABI.json";
-import { CONTRACT_ADDRESS, CHAIN_ID, SUPPORTED_NETWORKS } from "./config";
+import { CONTRACT_ADDRESS, ADMIN_ADDRESS, CHAIN_ID, SUPPORTED_NETWORKS } from "./config";
 
 /**
  * Returns a fallback Read-Only Provider (JSON-RPC) when MetaMask is not connected
@@ -67,28 +67,136 @@ export function parseEther(ethString) {
 }
 
 /**
- * Connect to MetaMask and return signer + address
+ * Connect to MetaMask using eth_requestAccounts and return signer + address + available accounts
  */
 export async function connectMetaMask() {
   if (typeof window === "undefined" || !window.ethereum) {
     throw new Error("MetaMask is not installed. Please install MetaMask to interact with FundChain.");
   }
 
-  const provider = new ethers.BrowserProvider(window.ethereum);
-  const accounts = await provider.send("eth_requestAccounts", []);
+  // Explicitly request accounts access via eth_requestAccounts
+  const accounts = await window.ethereum.request({
+    method: "eth_requestAccounts",
+  });
+
   if (!accounts || accounts.length === 0) {
     throw new Error("No accounts found. Please unlock your MetaMask wallet.");
   }
 
-  const signer = await provider.getSigner();
+  // Check if user previously had an active account stored in localStorage that is still authorized
+  const storedAccount = typeof localStorage !== "undefined" ? localStorage.getItem("fundchain_active_account") : null;
+  let activeAccount = accounts[0];
+  if (storedAccount && accounts.some((a) => a.toLowerCase() === storedAccount.toLowerCase())) {
+    activeAccount = accounts.find((a) => a.toLowerCase() === storedAccount.toLowerCase());
+  }
+
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem("fundchain_active_account", activeAccount);
+  }
+
+  const provider = new ethers.BrowserProvider(window.ethereum);
+  const signer = await provider.getSigner(activeAccount);
   const network = await provider.getNetwork();
 
   return {
     provider,
     signer,
-    account: accounts[0],
+    account: activeAccount,
+    availableAccounts: accounts,
     chainId: Number(network.chainId),
   };
+}
+
+/**
+ * Request MetaMask account selection modal so users can choose or switch between any available accounts
+ */
+export async function switchMetaMaskAccount(currentAccount = "") {
+  if (typeof window === "undefined" || !window.ethereum) {
+    throw new Error("MetaMask is not installed.");
+  }
+
+  let selectedFromPermissions = [];
+
+  try {
+    // Triggers MetaMask account chooser permission popup
+    const permissions = await window.ethereum.request({
+      method: "wallet_requestPermissions",
+      params: [{ eth_accounts: {} }],
+    });
+
+    const accountsPerm = permissions?.find((p) => p.parentCapability === "eth_accounts");
+    if (accountsPerm && accountsPerm.caveats) {
+      const caveat = accountsPerm.caveats.find(
+        (c) => c.type === "filterResponse" || c.type === "restrictReturnedAccounts"
+      );
+      if (caveat && Array.isArray(caveat.value) && caveat.value.length > 0) {
+        selectedFromPermissions = caveat.value.map((a) => a.toLowerCase());
+      }
+    }
+  } catch (err) {
+    if (err.code === 4001) {
+      throw new Error("Account switch request canceled in MetaMask.");
+    }
+    console.warn("wallet_requestPermissions fallback to eth_requestAccounts:", err);
+  }
+
+  // Request all authorized accounts
+  const accounts = await window.ethereum.request({
+    method: "eth_requestAccounts",
+  });
+
+  if (!accounts || accounts.length === 0) {
+    throw new Error("No accounts found in MetaMask.");
+  }
+
+  // Determine the new active account:
+  // 1. If user checked an account in the permission prompt that is different from current, use it
+  let targetAccount = accounts[0];
+  if (selectedFromPermissions.length > 0) {
+    const newlyChosen = selectedFromPermissions.find(
+      (a) => a.toLowerCase() !== (currentAccount || "").toLowerCase()
+    );
+    if (newlyChosen) {
+      const matched = accounts.find((a) => a.toLowerCase() === newlyChosen);
+      if (matched) targetAccount = matched;
+    } else {
+      const matched = accounts.find((a) => a.toLowerCase() === selectedFromPermissions[0]);
+      if (matched) targetAccount = matched;
+    }
+  } else if (currentAccount && accounts.length > 1) {
+    // If multiple accounts are connected and current is accounts[0], pick an alternative
+    const other = accounts.find((a) => a.toLowerCase() !== currentAccount.toLowerCase());
+    if (other) targetAccount = other;
+  }
+
+  const provider = new ethers.BrowserProvider(window.ethereum);
+  const signer = await provider.getSigner(targetAccount);
+  const network = await provider.getNetwork();
+
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem("fundchain_active_account", targetAccount);
+  }
+
+  return {
+    provider,
+    signer,
+    account: targetAccount,
+    availableAccounts: accounts,
+    chainId: Number(network.chainId),
+  };
+}
+
+/**
+ * Fetch all currently authorized accounts from MetaMask
+ */
+export async function getAuthorizedAccounts() {
+  if (typeof window === "undefined" || !window.ethereum) return [];
+  try {
+    const accounts = await window.ethereum.request({ method: "eth_accounts" });
+    return accounts || [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -106,7 +214,6 @@ export async function switchNetwork(targetChainId = CHAIN_ID) {
       params: [{ chainId: hexChainId }],
     });
   } catch (switchError) {
-    // Error code 4902 indicates that the network is not added to MetaMask
     if (switchError.code === 4902) {
       const net = SUPPORTED_NETWORKS[targetChainId];
       if (!net) throw new Error("Network configuration not found");
@@ -160,39 +267,147 @@ export async function getCampaignById(campaignId, provider = null) {
  */
 export async function getContributionStatus(campaignId, contributorAddress, provider = null) {
   if (!contributorAddress) {
-    return { contributedAmount: "0", hasClaimed: false, isEligibleForRefund: false };
+    return {
+      contributedAmount: "0",
+      hasClaimed: false,
+      isEligibleForRefund: false,
+      canWithdrawNow: false,
+      isAwaitingRelease: false,
+      isFundsReleased: false,
+    };
   }
   const contract = await getContract(provider);
-  const [contributedAmount, hasClaimed, isEligibleForRefund] = await contract.getContributionStatus(
-    campaignId,
-    contributorAddress
-  );
+  const res = await contract.getContributionStatus(campaignId, contributorAddress);
+  
   return {
-    contributedAmount: ethers.formatEther(contributedAmount),
-    hasClaimed,
-    isEligibleForRefund,
+    contributedAmount: ethers.formatEther(res[0]),
+    hasClaimed: res[1],
+    isEligibleForRefund: res[2],
+    canWithdrawNow: Boolean(res[3]),
+    isAwaitingRelease: Boolean(res[4]),
+    isFundsReleased: Boolean(res[5]),
   };
 }
 
 /**
- * Write function: Create a new campaign
+ * Read function: Get user's deposited vault balance
  */
-export async function createCampaignOnChain(signer, { title, description, goalEth, deadlineTimestamp, category, imageUrl }) {
+export async function getUserVaultBalance(userAddress, provider = null) {
+  if (!userAddress) return "0.0";
+  try {
+    const contract = await getContract(provider);
+    const bal = await contract.getVaultBalance(userAddress);
+    return ethers.formatEther(bal);
+  } catch (err) {
+    console.warn("Could not get vault balance:", err.message);
+    return "0.0";
+  }
+}
+
+/**
+ * Read function: Get contract administrator address
+ */
+export async function getAdminAddress(provider = null) {
+  try {
+    const contract = await getContract(provider);
+    return await contract.admin();
+  } catch (err) {
+    console.warn("Could not fetch admin address from contract, fallback to config:", err);
+    return ADMIN_ADDRESS;
+  }
+}
+
+/**
+ * Read function: Get comprehensive platform escrow & user stats for Admin Dashboard
+ */
+export async function getPlatformStats(provider = null) {
+  try {
+    const contract = await getContract(provider);
+    const stats = await contract.getPlatformStats();
+    return {
+      totalCampaigns: Number(stats[0]),
+      totalEscrowLocked: ethers.formatEther(stats[1]),
+      totalContributions: ethers.formatEther(stats[2]),
+      totalReleased: ethers.formatEther(stats[3]),
+      totalRefunded: ethers.formatEther(stats[4]),
+      totalUsers: Number(stats[5]),
+      contractBalance: ethers.formatEther(stats[6]),
+    };
+  } catch (err) {
+    console.warn("Could not fetch platform stats:", err);
+    return {
+      totalCampaigns: 0,
+      totalEscrowLocked: "0.0",
+      totalContributions: "0.0",
+      totalReleased: "0.0",
+      totalRefunded: "0.0",
+      totalUsers: 0,
+      contractBalance: "0.0",
+    };
+  }
+}
+
+/**
+ * Read function: Get list of all interacting user addresses
+ */
+export async function getAllInteractingUsers(provider = null) {
+  try {
+    const contract = await getContract(provider);
+    return await contract.getAllInteractingUsers();
+  } catch (err) {
+    console.warn("Could not fetch interacting users:", err);
+    return [];
+  }
+}
+
+/**
+ * Fast-forward local EVM blockchain time (for testing campaign deadlines)
+ */
+export async function fastForwardTime(seconds) {
+  if (typeof window === "undefined" || !window.ethereum) {
+    throw new Error("MetaMask or Web3 provider not detected");
+  }
+  try {
+    await window.ethereum.request({
+      method: "evm_increaseTime",
+      params: [seconds],
+    });
+    await window.ethereum.request({
+      method: "evm_mine",
+      params: [],
+    });
+    return true;
+  } catch (err) {
+    console.warn("Failed fast forwarding EVM time:", err);
+    throw err;
+  }
+}
+
+/**
+ * Write function: Create a new campaign with optional designated beneficiary
+ */
+export async function createCampaignOnChain(
+  signer,
+  { title, description, goalEth, deadlineTimestamp, category, imageUrl, beneficiary }
+) {
   if (!signer) throw new Error("Wallet not connected");
   const contract = new ethers.Contract(CONTRACT_ADDRESS, CrowdfundingABI, signer);
   const goalInWei = ethers.parseEther(goalEth.toString());
   
-  const tx = await contract.createCampaign(
+  const signerAddress = await signer.getAddress();
+  const beneficiaryAddress = beneficiary && ethers.isAddress(beneficiary) ? beneficiary : signerAddress;
+
+  const tx = await contract["createCampaign(string,string,uint256,uint256,string,string,address)"](
     title,
     description,
     goalInWei,
     deadlineTimestamp,
     category,
-    imageUrl || ""
+    imageUrl || "",
+    beneficiaryAddress
   );
   const receipt = await tx.wait();
   
-  // Find CampaignCreated event to retrieve ID
   let newCampaignId = null;
   for (const log of receipt.logs) {
     try {
@@ -210,7 +425,7 @@ export async function createCampaignOnChain(signer, { title, description, goalEt
 }
 
 /**
- * Write function: Contribute ETH to a campaign
+ * Write function: Contribute ETH to a campaign (stored in escrow)
  */
 export async function contributeOnChain(signer, campaignId, ethAmount) {
   if (!signer) throw new Error("Wallet not connected");
@@ -223,15 +438,34 @@ export async function contributeOnChain(signer, campaignId, ethAmount) {
 }
 
 /**
- * Write function: Withdraw funds (for creator)
+ * Write function: Permissionless release of escrowed funds to beneficiary
  */
-export async function withdrawFundsOnChain(signer, campaignId) {
+export async function releaseFundsOnChain(signer, campaignId) {
   if (!signer) throw new Error("Wallet not connected");
   const contract = new ethers.Contract(CONTRACT_ADDRESS, CrowdfundingABI, signer);
 
-  const tx = await contract.withdrawFunds(campaignId);
+  const tx = await contract.releaseFunds(campaignId);
   const receipt = await tx.wait();
   return { receipt, txHash: receipt.hash };
+}
+
+/**
+ * Write function: Contributor withdraws their contribution (early or refund)
+ */
+export async function withdrawContributionOnChain(signer, campaignId) {
+  if (!signer) throw new Error("Wallet not connected");
+  const contract = new ethers.Contract(CONTRACT_ADDRESS, CrowdfundingABI, signer);
+
+  const tx = await contract.withdrawContribution(campaignId);
+  const receipt = await tx.wait();
+  return { receipt, txHash: receipt.hash };
+}
+
+/**
+ * Write function: Withdraw funds (backward compatible)
+ */
+export async function withdrawFundsOnChain(signer, campaignId) {
+  return releaseFundsOnChain(signer, campaignId);
 }
 
 /**
@@ -247,18 +481,73 @@ export async function claimRefundOnChain(signer, campaignId) {
 }
 
 /**
- * Query all contract events for the Transaction History page
+ * Write function: Deposit ETH into FundChain user vault
+ */
+export async function depositFundsOnChain(signer, ethAmount) {
+  if (!signer) throw new Error("Wallet not connected");
+  const contract = new ethers.Contract(CONTRACT_ADDRESS, CrowdfundingABI, signer);
+  const valWei = ethers.parseEther(ethAmount.toString());
+
+  const tx = await contract.depositFunds({ value: valWei });
+  const receipt = await tx.wait();
+  return { receipt, txHash: receipt.hash };
+}
+
+/**
+ * Write function: Withdraw deposited ETH from FundChain user vault
+ */
+export async function withdrawVaultDepositOnChain(signer, ethAmount) {
+  if (!signer) throw new Error("Wallet not connected");
+  const contract = new ethers.Contract(CONTRACT_ADDRESS, CrowdfundingABI, signer);
+  const valWei = ethers.parseEther(ethAmount.toString());
+
+  const tx = await contract.withdrawVaultDeposit(valWei);
+  const receipt = await tx.wait();
+  return { receipt, txHash: receipt.hash };
+}
+
+/**
+ * Request test ETH on localhost network (funds user with 1.0 ETH from local Hardhat node)
+ */
+export async function requestLocalFaucet(toAddress) {
+  if (!toAddress) throw new Error("Recipient address required");
+  const localProvider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
+  
+  // Default Hardhat Account #0
+  const deployer = await localProvider.getSigner(0);
+  const tx = await deployer.sendTransaction({
+    to: toAddress,
+    value: ethers.parseEther("1.0"),
+  });
+  const receipt = await tx.wait();
+  return { receipt, txHash: receipt.hash };
+}
+
+/**
+ * Query all contract events for Transaction History and Admin Monitoring
  */
 export async function getAllContractEvents(provider = null) {
   try {
     const contract = await getContract(provider);
     
-    // Query each event type from genesis to latest
-    const [creationEvents, contributionEvents, withdrawalEvents, refundEvents] = await Promise.all([
+    const [
+      creationEvents,
+      contributionEvents,
+      contributionWithdrawnEvents,
+      fundsReleasedEvents,
+      withdrawalEvents,
+      refundEvents,
+      depositEvents,
+      vaultWithdrawEvents,
+    ] = await Promise.all([
       contract.queryFilter(contract.filters.CampaignCreated(), 0, "latest").catch(() => []),
       contract.queryFilter(contract.filters.ContributionReceived(), 0, "latest").catch(() => []),
+      contract.queryFilter(contract.filters.ContributionWithdrawn(), 0, "latest").catch(() => []),
+      contract.queryFilter(contract.filters.FundsReleased(), 0, "latest").catch(() => []),
       contract.queryFilter(contract.filters.FundsWithdrawn(), 0, "latest").catch(() => []),
       contract.queryFilter(contract.filters.RefundClaimed(), 0, "latest").catch(() => []),
+      contract.queryFilter(contract.filters.UserDeposited(), 0, "latest").catch(() => []),
+      contract.queryFilter(contract.filters.UserWithdrewDeposit(), 0, "latest").catch(() => []),
     ]);
 
     const formattedEvents = [];
@@ -269,12 +558,16 @@ export async function getAllContractEvents(provider = null) {
         type: "CampaignCreated",
         campaignId: Number(event.args.campaignId),
         address: event.args.creator,
+        from: event.args.creator,
+        to: event.args.beneficiary || event.args.creator,
+        beneficiary: event.args.beneficiary || event.args.creator,
         title: event.args.title,
         amount: ethers.formatEther(event.args.goal),
         category: event.args.category,
         txHash: event.transactionHash,
         blockNumber: event.blockNumber,
         timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
       });
     }
 
@@ -284,24 +577,67 @@ export async function getAllContractEvents(provider = null) {
         type: "ContributionReceived",
         campaignId: Number(event.args.campaignId),
         address: event.args.contributor,
+        from: event.args.contributor,
+        to: CONTRACT_ADDRESS,
         amount: ethers.formatEther(event.args.amount),
         txHash: event.transactionHash,
         blockNumber: event.blockNumber,
         timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
+      });
+    }
+
+    for (const event of contributionWithdrawnEvents) {
+      const block = await event.getBlock().catch(() => null);
+      formattedEvents.push({
+        type: "ContributionWithdrawn",
+        campaignId: Number(event.args.campaignId),
+        address: event.args.contributor,
+        from: CONTRACT_ADDRESS,
+        to: event.args.contributor,
+        amount: ethers.formatEther(event.args.amount),
+        txHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
+      });
+    }
+
+    // Dedup FundsReleased vs FundsWithdrawn (FundsReleased is preferred)
+    const seenReleaseTxs = new Set();
+    for (const event of fundsReleasedEvents) {
+      seenReleaseTxs.add(event.transactionHash);
+      const block = await event.getBlock().catch(() => null);
+      formattedEvents.push({
+        type: "FundsReleased",
+        campaignId: Number(event.args.campaignId),
+        address: event.args.beneficiary,
+        from: CONTRACT_ADDRESS,
+        to: event.args.beneficiary,
+        amount: ethers.formatEther(event.args.amount),
+        txHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
       });
     }
 
     for (const event of withdrawalEvents) {
-      const block = await event.getBlock().catch(() => null);
-      formattedEvents.push({
-        type: "FundsWithdrawn",
-        campaignId: Number(event.args.campaignId),
-        address: event.args.creator,
-        amount: ethers.formatEther(event.args.amount),
-        txHash: event.transactionHash,
-        blockNumber: event.blockNumber,
-        timestamp: block ? block.timestamp * 1000 : Date.now(),
-      });
+      if (!seenReleaseTxs.has(event.transactionHash)) {
+        const block = await event.getBlock().catch(() => null);
+        formattedEvents.push({
+          type: "FundsReleased",
+          campaignId: Number(event.args.campaignId),
+          address: event.args.beneficiary || event.args.creator,
+          from: CONTRACT_ADDRESS,
+          to: event.args.beneficiary || event.args.creator,
+          amount: ethers.formatEther(event.args.amount),
+          txHash: event.transactionHash,
+          blockNumber: event.blockNumber,
+          timestamp: block ? block.timestamp * 1000 : Date.now(),
+          status: "Confirmed",
+        });
+      }
     }
 
     for (const event of refundEvents) {
@@ -310,14 +646,48 @@ export async function getAllContractEvents(provider = null) {
         type: "RefundClaimed",
         campaignId: Number(event.args.campaignId),
         address: event.args.contributor,
+        from: CONTRACT_ADDRESS,
+        to: event.args.contributor,
         amount: ethers.formatEther(event.args.amount),
         txHash: event.transactionHash,
         blockNumber: event.blockNumber,
         timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
       });
     }
 
-    // Sort descending by timestamp / blockNumber
+    for (const event of depositEvents) {
+      const block = await event.getBlock().catch(() => null);
+      formattedEvents.push({
+        type: "UserDeposited",
+        campaignId: "-",
+        address: event.args.user,
+        from: event.args.user,
+        to: CONTRACT_ADDRESS,
+        amount: ethers.formatEther(event.args.amount),
+        txHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
+      });
+    }
+
+    for (const event of vaultWithdrawEvents) {
+      const block = await event.getBlock().catch(() => null);
+      formattedEvents.push({
+        type: "UserWithdrewDeposit",
+        campaignId: "-",
+        address: event.args.user,
+        from: CONTRACT_ADDRESS,
+        to: event.args.user,
+        amount: ethers.formatEther(event.args.amount),
+        txHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        timestamp: block ? block.timestamp * 1000 : Date.now(),
+        status: "Confirmed",
+      });
+    }
+
     return formattedEvents.sort((a, b) => b.timestamp - a.timestamp);
   } catch (err) {
     console.warn("Could not retrieve contract events:", err);
@@ -352,11 +722,15 @@ export async function getCampaignContributions(campaignId, provider = null) {
 }
 
 /**
- * Helper to structure Campaign struct into clean JavaScript object
+ * Helper to structure Campaign struct into clean JavaScript object with accurate Escrow statuses
  */
 export function formatCampaignData(c) {
   const goalEth = ethers.formatEther(c.goal || 0);
   const raisedEth = ethers.formatEther(c.amountRaised || 0);
+  const escrowEth = ethers.formatEther(c.escrowBalance || 0);
+  const releasedEth = ethers.formatEther(c.totalReleased || 0);
+  const refundedEth = ethers.formatEther(c.totalRefunded || 0);
+
   const deadlineNum = Number(c.deadline);
   const now = Math.floor(Date.now() / 1000);
 
@@ -366,32 +740,60 @@ export function formatCampaignData(c) {
 
   const isExpired = now >= deadlineNum;
   const isGoalReached = raisedFloat >= goalFloat;
+  const isReleased = Boolean(c.fundsReleased || c.withdrawn);
 
   let status = "Active";
-  if (c.withdrawn) {
-    status = "Withdrawn";
-  } else if (isExpired && isGoalReached) {
-    status = "Successful";
-  } else if (isExpired && !isGoalReached) {
-    status = "Failed";
-  } else if (!isExpired && isGoalReached) {
-    status = "Funded";
+  let statusBadge = "Funds Locked in Escrow";
+
+  if (isReleased) {
+    status = "Funds Released";
+    statusBadge = "Funds Released to Beneficiary";
+  } else if (!isExpired) {
+    if (isGoalReached) {
+      status = "Goal Achieved";
+      statusBadge = "Goal Reached (Funds Locked in Escrow)";
+    } else {
+      status = "Active";
+      statusBadge = "Active (Funds in Escrow)";
+    }
+  } else {
+    // Expired
+    if (isGoalReached) {
+      status = "Awaiting Release";
+      statusBadge = "Awaiting Release to Beneficiary";
+    } else {
+      if (parseFloat(escrowEth) > 0) {
+        status = "Refund Available";
+        statusBadge = "Refund Available";
+      } else {
+        status = "Refunded";
+        statusBadge = "All Funds Refunded";
+      }
+    }
   }
 
   return {
     id: Number(c.id),
     creator: c.creator,
+    beneficiary: c.beneficiary || c.creator,
     title: c.title,
     description: c.description,
     goal: goalEth,
     amountRaised: raisedEth,
+    escrowBalance: escrowEth,
+    totalReleased: releasedEth,
+    totalRefunded: refundedEth,
     deadline: deadlineNum,
+    createdAt: Number(c.createdAt || (deadlineNum - 86400 * 14)),
     category: c.category || "General",
     imageUrl: c.imageUrl || "",
     withdrawn: Boolean(c.withdrawn),
+    fundsReleased: isReleased,
     progressPercent,
     status,
+    statusBadge,
     isExpired,
     isGoalReached,
+    canReleaseFunds: isExpired && isGoalReached && !isReleased,
   };
 }

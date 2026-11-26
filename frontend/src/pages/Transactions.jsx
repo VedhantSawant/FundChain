@@ -22,8 +22,10 @@ const EVENT_FILTERS = [
   { id: "all", label: "All Transactions" },
   { id: "CampaignCreated", label: "Campaigns Created" },
   { id: "ContributionReceived", label: "Contributions" },
-  { id: "FundsWithdrawn", label: "Withdrawals" },
+  { id: "ContributionWithdrawn", label: "Contributor Withdrawals" },
+  { id: "FundsWithdrawn", label: "Creator Withdrawals" },
   { id: "RefundClaimed", label: "Refunds" },
+  { id: "UserDeposited", label: "Vault Deposits" },
 ];
 
 export default function Transactions() {
@@ -89,11 +91,32 @@ export default function Transactions() {
             Contributed
           </span>
         );
+      case "ContributionWithdrawn":
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-100 text-amber-900 border border-amber-200">
+            <RotateCcw className="w-3.5 h-3.5" />
+            Withdrew Contribution
+          </span>
+        );
+      case "UserDeposited":
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
+            <Coins className="w-3.5 h-3.5" />
+            Vault Deposit
+          </span>
+        );
+      case "UserWithdrewDeposit":
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-gray-200 text-gray-800 border border-gray-300">
+            <ArrowDownLeft className="w-3.5 h-3.5" />
+            Vault Withdrawal
+          </span>
+        );
       case "FundsWithdrawn":
         return (
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-purple-100 text-purple-800 border border-purple-200">
             <ArrowDownLeft className="w-3.5 h-3.5" />
-            Withdrawn
+            Creator Withdrawn
           </span>
         );
       case "RefundClaimed":

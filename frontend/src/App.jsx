@@ -4,6 +4,7 @@ import Navbar from "./components/Navbar";
 import Footer from "./components/Footer";
 import NetworkBanner from "./components/NetworkBanner";
 import NotificationModal from "./components/NotificationModal";
+import AddMoneyModal from "./components/AddMoneyModal";
 
 import Home from "./pages/Home";
 import Explore from "./pages/Explore";
@@ -11,6 +12,7 @@ import CampaignDetails from "./pages/CampaignDetails";
 import CreateCampaign from "./pages/CreateCampaign";
 import Dashboard from "./pages/Dashboard";
 import Transactions from "./pages/Transactions";
+import AdminDashboard from "./pages/AdminDashboard";
 
 export default function App() {
   return (
@@ -30,11 +32,15 @@ export default function App() {
           <Route path="/create" element={<CreateCampaign />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/transactions" element={<Transactions />} />
+          <Route path="/admin" element={<AdminDashboard />} />
         </Routes>
       </main>
 
       {/* Global Transaction Modal / Toast Feedback */}
       <NotificationModal />
+
+      {/* Add Money & Deposit Vault Modal */}
+      <AddMoneyModal />
 
       {/* Global Footer */}
       <Footer />

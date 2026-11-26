@@ -17,6 +17,9 @@ import {
   HeartHandshake,
   Calendar,
   Layers,
+  Lock,
+  Unlock,
+  CheckCircle2,
 } from "lucide-react";
 import { useWeb3 } from "../context/Web3Context";
 import ProgressBar from "../components/ProgressBar";
@@ -33,7 +36,9 @@ export default function CampaignDetails() {
     getContributionStatus,
     getCampaignContributions,
     contribute,
+    withdrawContribution,
     withdrawFunds,
+    releaseFunds,
     claimRefund,
     refreshCampaigns,
     chainId,
@@ -116,16 +121,50 @@ export default function CampaignDetails() {
 
   // Withdraw handler for creator
   const handleWithdraw = async () => {
-    if (!window.confirm("Are you sure you want to withdraw the collected funds to your creator wallet?")) {
+    if (!window.confirm("Are you sure you want to trigger the fund release to the beneficiary?")) {
       return;
     }
     setIsSubmitting(true);
     try {
-      await withdrawFunds(campaign.id);
+      await releaseFunds(campaign.id);
       await loadCampaignData();
       await refreshCampaigns();
     } catch (err) {
-      console.error("Withdrawal error:", err);
+      console.error("Release error:", err);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Permissionless Release of Escrow Funds to Beneficiary
+  const handleReleaseFunds = async () => {
+    if (!window.confirm(`Trigger smart contract escrow release to transfer ${campaign.escrowBalance} ETH to beneficiary (${shortenAddress(campaign.beneficiary)})?`)) {
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      await releaseFunds(campaign.id);
+      await loadCampaignData();
+      await refreshCampaigns();
+    } catch (err) {
+      console.error("Release error:", err);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Withdraw contribution handler for contributor (before deadline)
+  const handleWithdrawContribution = async () => {
+    if (!window.confirm(`Withdraw your contribution of ${userContribution.contributedAmount} ETH back to your wallet?`)) {
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      await withdrawContribution(campaign.id);
+      await loadCampaignData();
+      await refreshCampaigns();
+    } catch (err) {
+      console.error("Contribution withdrawal error:", err);
     } finally {
       setIsSubmitting(false);
     }
@@ -255,18 +294,19 @@ export default function CampaignDetails() {
               {campaign.description}
             </p>
 
-            {/* Creator Information Card */}
-            <div className="pt-6 border-t border-gray-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-gray-50/80 p-5 rounded-2xl border border-gray-200/60">
+            {/* Creator & Beneficiary Information Card */}
+            <div className="pt-6 border-t border-gray-100 grid grid-cols-1 sm:grid-cols-2 gap-4 bg-gray-50/80 p-5 rounded-2xl border border-gray-200/60">
+              {/* Creator */}
               <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center font-bold">
-                  <User className="w-6 h-6" />
+                <div className="w-11 h-11 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center font-bold">
+                  <User className="w-5 h-5" />
                 </div>
                 <div>
-                  <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                  <span className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide block">
                     Campaign Creator
                   </span>
                   <div className="flex items-center gap-2">
-                    <span className="font-mono text-sm font-bold text-gray-900">
+                    <span className="font-mono text-xs font-bold text-gray-900">
                       {shortenAddress(campaign.creator)}
                     </span>
                     <button
@@ -274,28 +314,38 @@ export default function CampaignDetails() {
                       className="p-1 text-gray-400 hover:text-emerald-700 transition-colors"
                       title="Copy Address"
                     >
-                      {copiedCreator ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
+                      {copiedCreator ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
-                    {explorerUrl && (
-                      <a
-                        href={`${explorerUrl}/address/${campaign.creator}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="p-1 text-gray-400 hover:text-emerald-700"
-                        title="View on Explorer"
-                      >
-                        <ExternalLink className="w-4 h-4" />
-                      </a>
+                    {isCreator && (
+                      <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded text-[10px] font-bold">
+                        You
+                      </span>
                     )}
                   </div>
                 </div>
               </div>
 
-              {isCreator && (
-                <span className="px-3 py-1 bg-emerald-100 text-emerald-800 rounded-lg text-xs font-bold border border-emerald-300 self-start sm:self-auto">
-                  You are the Creator
-                </span>
-              )}
+              {/* Beneficiary */}
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-xl bg-teal-100 text-teal-800 flex items-center justify-center font-bold">
+                  <HeartHandshake className="w-5 h-5" />
+                </div>
+                <div>
+                  <span className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide block">
+                    Designated Beneficiary
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs font-bold text-gray-900">
+                      {shortenAddress(campaign.beneficiary)}
+                    </span>
+                    {account && campaign.beneficiary && account.toLowerCase() === campaign.beneficiary.toLowerCase() && (
+                      <span className="px-2 py-0.5 bg-teal-100 text-teal-800 rounded text-[10px] font-bold">
+                        Your Wallet
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -375,17 +425,38 @@ export default function CampaignDetails() {
               </span>
               <span
                 className={`px-3 py-1 rounded-full text-xs font-bold border ${
-                  campaign.status === "Successful" || campaign.status === "Funded"
+                  campaign.fundsReleased
+                    ? "bg-teal-50 text-teal-700 border-teal-300"
+                    : campaign.canReleaseFunds
+                    ? "bg-indigo-50 text-indigo-700 border-indigo-300 animate-pulse"
+                    : campaign.status === "Goal Achieved"
                     ? "bg-emerald-50 text-emerald-700 border-emerald-300"
-                    : campaign.status === "Failed"
+                    : campaign.status === "Refund Available" || campaign.status === "Failed"
                     ? "bg-rose-50 text-rose-700 border-rose-300"
-                    : campaign.status === "Withdrawn"
-                    ? "bg-gray-100 text-gray-700 border-gray-300"
                     : "bg-blue-50 text-blue-700 border-blue-300"
                 }`}
               >
-                {campaign.status}
+                {campaign.statusBadge || campaign.status}
               </span>
+            </div>
+
+            {/* Escrow Balance & Beneficiary Payout Info */}
+            <div className="bg-emerald-50/70 p-3.5 rounded-2xl border border-emerald-100 space-y-1.5 text-xs">
+              <div className="flex justify-between items-center">
+                <span className="text-emerald-800 font-semibold flex items-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-emerald-600" />
+                  Locked in Escrow:
+                </span>
+                <span className="font-extrabold text-emerald-950 font-mono text-sm">
+                  {campaign.escrowBalance} ETH
+                </span>
+              </div>
+              <div className="flex justify-between items-center text-[11px] text-gray-600 pt-0.5 border-t border-emerald-200/60">
+                <span>Beneficiary:</span>
+                <span className="font-mono font-bold text-gray-900" title={campaign.beneficiary}>
+                  {shortenAddress(campaign.beneficiary)}
+                </span>
+              </div>
             </div>
 
             {/* Amounts Raised / Goal */}
@@ -435,34 +506,58 @@ export default function CampaignDetails() {
                 {userContribution.hasClaimed && (
                   <p className="text-rose-700 font-bold">✓ Refund already claimed</p>
                 )}
-              </div>
-            )}
 
-            {/* ACTION 1: Creator Withdraw Funds Button */}
-            {isCreator && (
-              <div className="space-y-3 pt-2">
-                {canWithdraw ? (
+                {!isEnded && !isCreator && (
                   <button
-                    onClick={handleWithdraw}
+                    type="button"
+                    onClick={handleWithdrawContribution}
                     disabled={isSubmitting}
-                    className="w-full py-3.5 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 text-white rounded-xl text-sm font-bold shadow-lg shadow-emerald-900/20 transition-all flex items-center justify-center gap-2"
+                    className="w-full mt-2.5 py-2.5 px-3 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 shadow-sm"
                   >
-                    <Coins className="w-4 h-4" />
-                    <span>Withdraw Collected Funds ({campaign.amountRaised} ETH)</span>
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Withdraw My Contribution ({userContribution.contributedAmount} ETH)</span>
                   </button>
-                ) : campaign.withdrawn ? (
-                  <div className="p-3 bg-gray-100 text-gray-600 text-xs rounded-xl font-medium text-center">
-                    ✓ Funds have already been withdrawn to your creator wallet.
-                  </div>
-                ) : (
-                  <div className="p-3 bg-amber-50 border border-amber-200 text-amber-800 text-xs rounded-xl">
-                    <strong>Creator Notice:</strong> Funds can only be withdrawn after the campaign deadline has passed and if the funding goal was achieved.
-                  </div>
                 )}
               </div>
             )}
 
-            {/* ACTION 2: Contributor Refund Button */}
+            {/* ACTION 1: Permissionless Release Escrow to Beneficiary */}
+            {campaign.canReleaseFunds && (
+              <div className="space-y-3 pt-2">
+                <div className="p-3 bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 text-emerald-900 text-xs rounded-2xl space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold">
+                    <Sparkles className="w-4 h-4 text-emerald-600" />
+                    <span>Goal Met & Deadline Reached!</span>
+                  </div>
+                  <p className="text-[11px] text-emerald-800">
+                    The smart contract escrow is ready to disburse <strong>{campaign.escrowBalance} ETH</strong> directly to the beneficiary wallet. Anyone can execute this permissionless release.
+                  </p>
+                </div>
+                <button
+                  onClick={handleReleaseFunds}
+                  disabled={isSubmitting}
+                  className="w-full py-3.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl text-sm font-bold shadow-lg shadow-emerald-900/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Unlock className="w-4 h-4" />
+                  <span>Release Escrow to Beneficiary ({campaign.escrowBalance} ETH)</span>
+                </button>
+              </div>
+            )}
+
+            {/* ACTION 2: Funds Released Banner */}
+            {campaign.fundsReleased && (
+              <div className="p-3.5 bg-teal-50 border border-teal-200 text-teal-900 text-xs rounded-2xl font-medium space-y-1">
+                <div className="flex items-center gap-1.5 font-bold text-teal-800">
+                  <CheckCircle2 className="w-4 h-4 text-teal-600" />
+                  <span>Funds Successfully Released</span>
+                </div>
+                <p className="text-[11px] text-teal-700">
+                  Collected ETH was disbursed directly to the designated beneficiary ({shortenAddress(campaign.beneficiary)}).
+                </p>
+              </div>
+            )}
+
+            {/* ACTION 3: Contributor Refund Button */}
             {canRefund && (
               <div className="space-y-3 pt-2">
                 <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 text-xs rounded-xl">
@@ -471,7 +566,7 @@ export default function CampaignDetails() {
                 <button
                   onClick={handleClaimRefund}
                   disabled={isSubmitting}
-                  className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-sm font-bold shadow-lg shadow-rose-900/20 transition-all flex items-center justify-center gap-2"
+                  className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-sm font-bold shadow-lg shadow-rose-900/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <RotateCcw className="w-4 h-4" />
                   <span>Claim My Refund ({userContribution.contributedAmount} ETH)</span>

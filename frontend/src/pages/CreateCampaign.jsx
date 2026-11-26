@@ -59,6 +59,7 @@ export default function CreateCampaign() {
     deadline: defaultDeadline,
     category: "Agriculture",
     imageUrl: "",
+    beneficiary: "",
   });
 
   const [validationError, setValidationError] = useState("");
@@ -121,6 +122,7 @@ export default function CreateCampaign() {
         deadlineTimestamp,
         category: formData.category,
         imageUrl: formData.imageUrl.trim(),
+        beneficiary: formData.beneficiary.trim() || account,
       });
 
       // Redirect to newly created campaign
@@ -288,6 +290,24 @@ export default function CreateCampaign() {
                   ))}
                 </div>
               </div>
+            </div>
+
+            {/* Beneficiary Wallet Address */}
+            <div>
+              <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
+                Beneficiary Wallet Address (Optional)
+              </label>
+              <input
+                type="text"
+                name="beneficiary"
+                placeholder={account ? `${account} (Defaults to your wallet)` : "0x... (Defaults to your wallet)"}
+                value={formData.beneficiary}
+                onChange={handleChange}
+                className="w-full px-4 py-3 bg-[#F8FAF7] border border-gray-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 transition-all"
+              />
+              <p className="text-[11px] text-gray-500 mt-1">
+                The smart contract escrow will disburse the collected funds directly to this beneficiary address upon successful goal completion.
+              </p>
             </div>
 
             {/* Image URL */}

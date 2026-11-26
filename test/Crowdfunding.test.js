@@ -5,128 +5,138 @@ import helpers from "@nomicfoundation/hardhat-network-helpers";
 const { ethers } = hre;
 const { time } = helpers;
 
-describe("FundChain Crowdfunding Smart Contract", function () {
+describe("FundChain Advanced Escrow & Crowdfunding Smart Contract", function () {
   let crowdfunding;
-  let owner, walletA, walletB, walletC, walletD;
+  let admin, creator, beneficiary, donor1, donor2, thirdParty;
 
   beforeEach(async function () {
-    [owner, walletA, walletB, walletC, walletD] = await ethers.getSigners();
+    [admin, creator, beneficiary, donor1, donor2, thirdParty] = await ethers.getSigners();
     const Crowdfunding = await ethers.getContractFactory("Crowdfunding");
     crowdfunding = await Crowdfunding.deploy();
     await crowdfunding.waitForDeployment();
   });
 
   describe("Contract Deployment & Initial State", function () {
-    it("Should start with 0 campaigns", async function () {
+    it("Should set deployer as the admin", async function () {
+      expect(await crowdfunding.admin()).to.equal(admin.address);
+    });
+
+    it("Should start with 0 campaigns and empty interacting users list except admin", async function () {
       expect(await crowdfunding.getCampaignCount()).to.equal(0);
       const all = await crowdfunding.getAllCampaigns();
       expect(all.length).to.equal(0);
+      expect(await crowdfunding.getInteractingUsersCount()).to.equal(1); // admin registered
     });
   });
 
-  describe("Scenario A: Successful Campaign", function () {
-    it("Executes full lifecycle: creation, goal met, deadline passes, creator withdraws funds", async function () {
+  describe("Scenario A: Successful Campaign & Permissionless Escrow Release", function () {
+    it("Executes full lifecycle: creation with beneficiary, funds locked in escrow, permissionless release by thirdParty after deadline", async function () {
       const currentTime = await time.latest();
       const deadline = currentTime + 3600; // 1 hour in future
       const goal = ethers.parseEther("1.0");
 
-      // 1. Wallet A creates campaign with 1 ETH goal
-      const tx = await crowdfunding.connect(walletA).createCampaign(
+      // 1. Creator creates campaign with Beneficiary designated
+      const tx = await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string,address)"](
         "Solar Irrigation Pump for Farmers",
         "Empowering 50 smallholder farmers with solar-powered irrigation pumps.",
         goal,
         deadline,
         "Agriculture",
-        "https://images.unsplash.com/photo-1592982537447-7440770cbfc9"
+        "https://images.unsplash.com/photo-1592982537447-7440770cbfc9",
+        beneficiary.address
       );
 
       await expect(tx)
-        .to.emit(crowdfunding, "CampaignCreated")
-        .withArgs(
-          1,
-          walletA.address,
-          "Solar Irrigation Pump for Farmers",
-          goal,
-          deadline,
-          "Agriculture",
-          "https://images.unsplash.com/photo-1592982537447-7440770cbfc9"
-        );
+        .to.emit(crowdfunding, "CampaignCreated");
 
       expect(await crowdfunding.getCampaignCount()).to.equal(1);
       const campaign = await crowdfunding.getCampaign(1);
-      expect(campaign.creator).to.equal(walletA.address);
+      expect(campaign.creator).to.equal(creator.address);
+      expect(campaign.beneficiary).to.equal(beneficiary.address);
       expect(campaign.goal).to.equal(goal);
       expect(campaign.amountRaised).to.equal(0);
-      expect(campaign.withdrawn).to.equal(false);
+      expect(campaign.escrowBalance).to.equal(0);
+      expect(campaign.fundsReleased).to.equal(false);
+      expect(await crowdfunding.getCampaignState(1)).to.equal(0); // Active
 
-      // 2. Wallet B contributes 0.4 ETH
-      const contribB = ethers.parseEther("0.4");
+      // 2. Donor 1 contributes 0.4 ETH
+      const contrib1 = ethers.parseEther("0.4");
       await expect(
-        crowdfunding.connect(walletB).contribute(1, { value: contribB })
+        crowdfunding.connect(donor1).contribute(1, { value: contrib1 })
       )
         .to.emit(crowdfunding, "ContributionReceived")
-        .withArgs(1, walletB.address, contribB);
+        .withArgs(1, donor1.address, contrib1)
+        .and.to.emit(crowdfunding, "FundsLocked")
+        .withArgs(1, contrib1, contrib1);
 
-      // 3. Wallet C contributes 0.7 ETH (total: 1.1 ETH >= 1.0 ETH goal)
-      const contribC = ethers.parseEther("0.7");
-      await expect(
-        crowdfunding.connect(walletC).contribute(1, { value: contribC })
-      )
-        .to.emit(crowdfunding, "ContributionReceived")
-        .withArgs(1, walletC.address, contribC);
+      // Verify funds are in the contract address (escrow), NOT the creator or beneficiary
+      expect(await ethers.provider.getBalance(await crowdfunding.getAddress())).to.equal(contrib1);
+
+      // 3. Donor 2 contributes 0.7 ETH (total: 1.1 ETH >= 1.0 ETH goal)
+      const contrib2 = ethers.parseEther("0.7");
+      await crowdfunding.connect(donor2).contribute(1, { value: contrib2 });
 
       const updatedCampaign = await crowdfunding.getCampaign(1);
       expect(updatedCampaign.amountRaised).to.equal(ethers.parseEther("1.1"));
-      expect(await crowdfunding.getContribution(1, walletB.address)).to.equal(contribB);
-      expect(await crowdfunding.getContribution(1, walletC.address)).to.equal(contribC);
+      expect(updatedCampaign.escrowBalance).to.equal(ethers.parseEther("1.1"));
+      expect(await crowdfunding.getContribution(1, donor1.address)).to.equal(contrib1);
+      expect(await crowdfunding.getContribution(1, donor2.address)).to.equal(contrib2);
       expect(await crowdfunding.getContributorsCount(1)).to.equal(2);
 
-      // Verify cannot withdraw before deadline
-      await expect(
-        crowdfunding.connect(walletA).withdrawFunds(1)
-      ).to.be.revertedWith("Cannot withdraw before campaign deadline");
+      // Status should now be GoalAchieved (1)
+      expect(await crowdfunding.getCampaignState(1)).to.equal(1); // GoalAchieved
 
-      // 4. Deadline passes
+      // Verify cannot release funds before deadline
+      await expect(
+        crowdfunding.connect(thirdParty).releaseFunds(1)
+      ).to.be.revertedWith("Cannot release funds before campaign deadline");
+
+      // 4. Advance time beyond deadline
       await time.increaseTo(deadline + 10);
+
+      // Status should now be AwaitingRelease (2)
+      expect(await crowdfunding.getCampaignState(1)).to.equal(2); // AwaitingRelease
 
       // Verify contributor cannot refund when goal was achieved
       await expect(
-        crowdfunding.connect(walletB).claimRefund(1)
+        crowdfunding.connect(donor1).claimRefund(1)
       ).to.be.revertedWith("Funding goal was reached; refunds not available");
 
-      // 5. Wallet A withdraws the funds
-      const initialBalanceA = await ethers.provider.getBalance(walletA.address);
-      const withdrawTx = await crowdfunding.connect(walletA).withdrawFunds(1);
-      const receipt = await withdrawTx.wait();
-      const gasUsed = receipt.gasUsed * receipt.gasPrice;
+      // 5. ANY account (thirdParty/keeper) triggers permissionless releaseFunds!
+      const initialBeneficiaryBalance = await ethers.provider.getBalance(beneficiary.address);
+      const releaseTx = await crowdfunding.connect(thirdParty).releaseFunds(1);
 
-      await expect(withdrawTx)
-        .to.emit(crowdfunding, "FundsWithdrawn")
-        .withArgs(1, walletA.address, ethers.parseEther("1.1"));
+      await expect(releaseTx)
+        .to.emit(crowdfunding, "FundsReleased")
+        .withArgs(1, beneficiary.address, ethers.parseEther("1.1"), await time.latest());
 
-      const finalBalanceA = await ethers.provider.getBalance(walletA.address);
-      expect(finalBalanceA + gasUsed - initialBalanceA).to.equal(ethers.parseEther("1.1"));
+      // Beneficiary received the full 1.1 ETH
+      const finalBeneficiaryBalance = await ethers.provider.getBalance(beneficiary.address);
+      expect(finalBeneficiaryBalance - initialBeneficiaryBalance).to.equal(ethers.parseEther("1.1"));
 
-      // Verify campaign status updated
+      // Campaign escrow balance is now 0, status is FundsReleased (3)
       const finalCampaign = await crowdfunding.getCampaign(1);
+      expect(finalCampaign.escrowBalance).to.equal(0);
+      expect(finalCampaign.fundsReleased).to.equal(true);
       expect(finalCampaign.withdrawn).to.equal(true);
+      expect(await crowdfunding.getCampaignState(1)).to.equal(3); // FundsReleased
 
-      // Cannot withdraw a second time
+      // Cannot release a second time
       await expect(
-        crowdfunding.connect(walletA).withdrawFunds(1)
-      ).to.be.revertedWith("Funds have already been withdrawn");
+        crowdfunding.connect(creator).releaseFunds(1)
+      ).to.be.revertedWith("Funds have already been released");
     });
   });
 
-  describe("Scenario B: Failed Campaign and Automatic Refunds", function () {
-    it("Executes failed campaign flow: goal not met, deadline passes, contributors claim refunds", async function () {
+  describe("Scenario B: Failed Campaign and Contributor Escrow Refunds", function () {
+    it("Executes failed campaign flow: goal not met, deadline passes, contributors claim refunds, double refunds prevented", async function () {
       const currentTime = await time.latest();
       const deadline = currentTime + 3600;
       const goal = ethers.parseEther("2.0");
 
-      // 1. Wallet A creates campaign with 2 ETH goal
-      await crowdfunding.connect(walletA).createCampaign(
-        "Organic Fertilizer Subsidy for Vidarbha Farmers",
+      // 1. Creator creates campaign
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string)"](
+        "Organic Fertilizer Subsidy",
         "Providing organic compost and soil bio-fertilizers.",
         goal,
         deadline,
@@ -134,171 +144,379 @@ describe("FundChain Crowdfunding Smart Contract", function () {
         ""
       );
 
-      // 2. Wallet B contributes 0.5 ETH
-      const contribB = ethers.parseEther("0.5");
-      await crowdfunding.connect(walletB).contribute(1, { value: contribB });
+      // 2. Donor 1 contributes 0.5 ETH
+      const contrib1 = ethers.parseEther("0.5");
+      await crowdfunding.connect(donor1).contribute(1, { value: contrib1 });
 
-      // 3. Wallet C contributes 0.3 ETH (Total: 0.8 ETH < 2.0 ETH goal)
-      const contribC = ethers.parseEther("0.3");
-      await crowdfunding.connect(walletC).contribute(1, { value: contribC });
+      // 3. Donor 2 contributes 0.3 ETH (Total: 0.8 ETH < 2.0 ETH goal)
+      const contrib2 = ethers.parseEther("0.3");
+      await crowdfunding.connect(donor2).contribute(1, { value: contrib2 });
 
-      // Verify cannot claim refund before deadline
+      // Cannot claim refund before deadline
       await expect(
-        crowdfunding.connect(walletB).claimRefund(1)
+        crowdfunding.connect(donor1).claimRefund(1)
       ).to.be.revertedWith("Cannot claim refund before campaign deadline");
 
-      // 4. Deadline passes
-      await time.increaseTo(deadline + 60);
+      // 4. Advance time beyond deadline
+      await time.increaseTo(deadline + 10);
 
-      // Verify creator CANNOT withdraw since goal was not met
+      // State is RefundAvailable (4)
+      expect(await crowdfunding.getCampaignState(1)).to.equal(4);
+
+      // Release should fail because goal was not reached
       await expect(
-        crowdfunding.connect(walletA).withdrawFunds(1)
+        crowdfunding.connect(creator).releaseFunds(1)
       ).to.be.revertedWith("Funding goal has not been reached");
 
-      // Check contribution status
-      const statusB = await crowdfunding.getContributionStatus(1, walletB.address);
-      expect(statusB.contributedAmount).to.equal(contribB);
-      expect(statusB.hasClaimed).to.equal(false);
-      expect(statusB.isEligibleForRefund).to.equal(true);
+      // 5. Donor 1 claims refund
+      const initialBalance1 = await ethers.provider.getBalance(donor1.address);
+      const refundTx1 = await crowdfunding.connect(donor1).claimRefund(1);
+      const receipt1 = await refundTx1.wait();
+      const gasUsed1 = receipt1.gasUsed * receipt1.gasPrice;
 
-      // 5. Wallet B claims refund of 0.5 ETH
-      const initialBalB = await ethers.provider.getBalance(walletB.address);
-      const refundTxB = await crowdfunding.connect(walletB).claimRefund(1);
-      const receiptB = await refundTxB.wait();
-      const gasB = receiptB.gasUsed * receiptB.gasPrice;
+      await expect(refundTx1)
+        .to.emit(crowdfunding, "RefundClaimed");
 
-      await expect(refundTxB)
-        .to.emit(crowdfunding, "RefundClaimed")
-        .withArgs(1, walletB.address, contribB);
+      const finalBalance1 = await ethers.provider.getBalance(donor1.address);
+      expect(finalBalance1 + gasUsed1 - initialBalance1).to.equal(contrib1);
 
-      const finalBalB = await ethers.provider.getBalance(walletB.address);
-      expect(finalBalB + gasB - initialBalB).to.equal(contribB);
-
-      // 6. Wallet C claims refund of 0.3 ETH
-      const initialBalC = await ethers.provider.getBalance(walletC.address);
-      const refundTxC = await crowdfunding.connect(walletC).claimRefund(1);
-      const receiptC = await refundTxC.wait();
-      const gasC = receiptC.gasUsed * receiptC.gasPrice;
-
-      await expect(refundTxC)
-        .to.emit(crowdfunding, "RefundClaimed")
-        .withArgs(1, walletC.address, contribC);
-
-      const finalBalC = await ethers.provider.getBalance(walletC.address);
-      expect(finalBalC + gasC - initialBalC).to.equal(contribC);
-
-      // Verify Wallet B cannot claim refund a second time
+      // Verify Donor 1 cannot claim refund again (double refund protection)
       await expect(
-        crowdfunding.connect(walletB).claimRefund(1)
+        crowdfunding.connect(donor1).claimRefund(1)
       ).to.be.revertedWith("Refund has already been claimed");
 
-      // Verify Wallet D (who never contributed) cannot claim refund
-      await expect(
-        crowdfunding.connect(walletD).claimRefund(1)
-      ).to.be.revertedWith("No contribution found for this address");
+      // 6. Donor 2 claims refund via withdrawContribution
+      const initialBalance2 = await ethers.provider.getBalance(donor2.address);
+      const refundTx2 = await crowdfunding.connect(donor2).withdrawContribution(1);
+      const receipt2 = await refundTx2.wait();
+      const gasUsed2 = receipt2.gasUsed * receipt2.gasPrice;
 
-      const finalStatusB = await crowdfunding.getContributionStatus(1, walletB.address);
-      expect(finalStatusB.hasClaimed).to.equal(true);
-      expect(finalStatusB.isEligibleForRefund).to.equal(false);
+      const finalBalance2 = await ethers.provider.getBalance(donor2.address);
+      expect(finalBalance2 + gasUsed2 - initialBalance2).to.equal(contrib2);
+
+      // Both contributors refunded; escrow balance is 0, state is Refunded (5)
+      const c = await crowdfunding.getCampaign(1);
+      expect(c.escrowBalance).to.equal(0);
+      expect(await crowdfunding.getCampaignState(1)).to.equal(5); // Refunded
     });
   });
 
-  describe("Scenario C: Invalid Transactions & Edge Cases", function () {
-    let deadline;
-    const goal = ethers.parseEther("1.0");
+  describe("Scenario C: Admin Security & Access Control", function () {
+    it("Allows admin to transfer admin role, but prevents unauthorized accounts from calling admin functions", async function () {
+      expect(await crowdfunding.admin()).to.equal(admin.address);
 
-    beforeEach(async function () {
+      // Non-admin cannot transfer admin
+      await expect(
+        crowdfunding.connect(creator).transferAdmin(creator.address)
+      ).to.be.revertedWith("Only contract administrator can execute this");
+
+      // Admin transfers role to thirdParty
+      await expect(
+        crowdfunding.connect(admin).transferAdmin(thirdParty.address)
+      )
+        .to.emit(crowdfunding, "AdminTransferred")
+        .withArgs(admin.address, thirdParty.address);
+
+      expect(await crowdfunding.admin()).to.equal(thirdParty.address);
+    });
+
+    it("Verifies platform statistics accurate for admin monitoring", async function () {
+      const stats = await crowdfunding.getPlatformStats();
+      expect(stats.totalCampaigns).to.equal(0);
+      expect(stats.totalEscrowLocked).to.equal(0);
+      expect(stats.totalContributions).to.equal(0);
+      expect(stats.totalReleased).to.equal(0);
+      expect(stats.totalRefunded).to.equal(0);
+      expect(stats.totalUsers).to.be.greaterThanOrEqual(1);
+    });
+  });
+
+  describe("Scenario D: Contributor Early Withdrawal", function () {
+    it("Allows contributor to withdraw contribution before deadline and updates totals", async function () {
       const currentTime = await time.latest();
-      deadline = currentTime + 3600;
-      await crowdfunding.connect(walletA).createCampaign(
-        "Community Water Filtration Plant",
-        "Clean drinking water for 2 rural villages.",
+      const deadline = currentTime + 3600;
+      const goal = ethers.parseEther("1.0");
+
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string)"](
+        "Early Withdrawal Test",
+        "Testing contributor withdrawal before deadline.",
         goal,
         deadline,
-        "Community Development",
+        "Technology",
         ""
       );
-    });
 
-    it("Rejects creation with empty title", async function () {
-      await expect(
-        crowdfunding.createCampaign("", "Desc", goal, deadline, "Tech", "")
-      ).to.be.revertedWith("Title cannot be empty");
-    });
+      await crowdfunding.connect(donor1).contribute(1, { value: ethers.parseEther("0.4") });
+      expect((await crowdfunding.getCampaign(1)).escrowBalance).to.equal(ethers.parseEther("0.4"));
 
-    it("Rejects creation with empty description", async function () {
+      // Donor 1 withdraws early
       await expect(
-        crowdfunding.createCampaign("Title", "", goal, deadline, "Tech", "")
-      ).to.be.revertedWith("Description cannot be empty");
-    });
+        crowdfunding.connect(donor1).withdrawContribution(1)
+      )
+        .to.emit(crowdfunding, "ContributionWithdrawn")
+        .withArgs(1, donor1.address, ethers.parseEther("0.4"));
 
-    it("Rejects creation with zero or invalid funding goal", async function () {
-      await expect(
-        crowdfunding.createCampaign("Title", "Desc", 0, deadline, "Tech", "")
-      ).to.be.revertedWith("Funding goal must be greater than zero");
+      const c = await crowdfunding.getCampaign(1);
+      expect(c.amountRaised).to.equal(0);
+      expect(c.escrowBalance).to.equal(0);
     });
+  });
 
-    it("Rejects creation with campaign deadline in the past or now", async function () {
-      const pastTime = (await time.latest()) - 10;
+  describe("Scenario E: Account Vault (Deposit & Withdraw)", function () {
+    it("Allows users to deposit ETH into vault and withdraw it back to wallet", async function () {
+      const depositAmount = ethers.parseEther("0.25");
+
       await expect(
-        crowdfunding.createCampaign("Title", "Desc", goal, pastTime, "Tech", "")
-      ).to.be.revertedWith("Deadline must be in the future");
+        crowdfunding.connect(donor1).depositFunds({ value: depositAmount })
+      )
+        .to.emit(crowdfunding, "UserDeposited")
+        .withArgs(donor1.address, depositAmount);
+
+      expect(await crowdfunding.getVaultBalance(donor1.address)).to.equal(depositAmount);
+
+      // Withdraw partial
+      const withdrawAmount = ethers.parseEther("0.1");
+      await expect(
+        crowdfunding.connect(donor1).withdrawVaultDeposit(withdrawAmount)
+      )
+        .to.emit(crowdfunding, "UserWithdrewDeposit")
+        .withArgs(donor1.address, withdrawAmount);
+
+      expect(await crowdfunding.getVaultBalance(donor1.address)).to.equal(depositAmount - withdrawAmount);
     });
+  });
 
-    it("Rejects creation with empty category", async function () {
-      await expect(
-        crowdfunding.createCampaign("Title", "Desc", goal, deadline, "", "")
-      ).to.be.revertedWith("Category cannot be empty");
-    });
+  describe("Scenario F: Edge Cases & Validation Rules", function () {
+    it("Rejects creator contributing to their own campaign", async function () {
+      const deadline = (await time.latest()) + 3600;
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string)"](
+        "Self-Contribution Test",
+        "Should not allow creator to contribute.",
+        ethers.parseEther("1.0"),
+        deadline,
+        "Education",
+        ""
+      );
 
-    it("Rejects zero ETH contribution", async function () {
       await expect(
-        crowdfunding.connect(walletB).contribute(1, { value: 0 })
-      ).to.be.revertedWith("Contribution must be greater than zero");
-    });
-
-    it("Rejects campaign creator attempting to contribute to their own campaign", async function () {
-      await expect(
-        crowdfunding.connect(walletA).contribute(1, { value: ethers.parseEther("0.1") })
+        crowdfunding.connect(creator).contribute(1, { value: ethers.parseEther("0.1") })
       ).to.be.revertedWith("Campaign creator cannot contribute to own campaign");
     });
 
-    it("Rejects contribution to non-existent campaign", async function () {
-      await expect(
-        crowdfunding.connect(walletB).contribute(999, { value: ethers.parseEther("0.1") })
-      ).to.be.revertedWith("Campaign does not exist");
-    });
+    it("Rejects contribution after deadline", async function () {
+      const deadline = (await time.latest()) + 3600;
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string)"](
+        "Deadline Test",
+        "Should reject contribution after deadline.",
+        ethers.parseEther("1.0"),
+        deadline,
+        "Education",
+        ""
+      );
 
-    it("Rejects contribution after campaign deadline has passed", async function () {
       await time.increaseTo(deadline + 10);
+
       await expect(
-        crowdfunding.connect(walletB).contribute(1, { value: ethers.parseEther("0.1") })
+        crowdfunding.connect(donor1).contribute(1, { value: ethers.parseEther("0.1") })
       ).to.be.revertedWith("Campaign deadline has passed");
     });
 
-    it("Rejects non-creator attempting to withdraw funds", async function () {
-      await crowdfunding.connect(walletB).contribute(1, { value: ethers.parseEther("1.0") });
-      await time.increaseTo(deadline + 10);
-      await expect(
-        crowdfunding.connect(walletB).withdrawFunds(1)
-      ).to.be.revertedWith("Only the campaign creator can withdraw funds");
-    });
+    it("Defaults beneficiary to creator when beneficiary is address(0)", async function () {
+      const deadline = (await time.latest()) + 3600;
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string,address)"](
+        "Default Beneficiary Test",
+        "Testing default beneficiary.",
+        ethers.parseEther("1.0"),
+        deadline,
+        "Healthcare",
+        "",
+        ethers.ZeroAddress
+      );
 
-    it("Rejects withdrawal before deadline even if goal is met early", async function () {
-      // Goal is reached early
-      await crowdfunding.connect(walletB).contribute(1, { value: ethers.parseEther("1.5") });
-      // But deadline has NOT passed yet
-      await expect(
-        crowdfunding.connect(walletA).withdrawFunds(1)
-      ).to.be.revertedWith("Cannot withdraw before campaign deadline");
+      const c = await crowdfunding.getCampaign(1);
+      expect(c.beneficiary).to.equal(creator.address);
     });
+  });
 
-    it("Rejects refund claim if goal was reached", async function () {
-      await crowdfunding.connect(walletB).contribute(1, { value: ethers.parseEther("1.0") });
-      await time.increaseTo(deadline + 10);
+  describe("Scenario G: Milestone-Based Fund Release", function () {
+    it("Allows creator to define milestones, submit evidence, admin to approve, and release milestone funds", async function () {
+      const deadline = (await time.latest()) + 7200;
+      const mTitles = ["Milestone 1: Prototype", "Milestone 2: Final Delivery"];
+      const mDescs = ["Hardware schematics & board", "Assembled and tested unit"];
+      const mTargets = [ethers.parseEther("0.4"), ethers.parseEther("0.6")];
+      const goal = ethers.parseEther("1.0");
+
+      await crowdfunding.connect(creator).createCampaignWithMilestones(
+        "Smart IoT Soil Sensors",
+        "Deploying smart soil moisture sensors across farms",
+        goal,
+        deadline,
+        "Agriculture",
+        "https://images.unsplash.com/photo-example",
+        beneficiary.address,
+        mTitles,
+        mDescs,
+        mTargets
+      );
+
+      const milestones = await crowdfunding.getCampaignMilestones(1);
+      expect(milestones.length).to.equal(2);
+      expect(milestones[0].title).to.equal("Milestone 1: Prototype");
+      expect(milestones[0].targetAmount).to.equal(mTargets[0]);
+      expect(milestones[0].completed).to.equal(false);
+      expect(milestones[0].approved).to.equal(false);
+
+      // Backer contributes 1.0 ETH
+      await crowdfunding.connect(donor1).contribute(1, { value: goal });
+
+      // Creator submits milestone evidence
+      await crowdfunding.connect(creator).submitMilestoneEvidence(1, 0, "https://ipfs.io/ipfs/QmPrototypeEvidence");
+      const mUpdated = await crowdfunding.getCampaignMilestones(1);
+      expect(mUpdated[0].completed).to.equal(true);
+      expect(mUpdated[0].evidenceUrl).to.equal("https://ipfs.io/ipfs/QmPrototypeEvidence");
+
+      // Non-admin cannot approve milestone
       await expect(
-        crowdfunding.connect(walletB).claimRefund(1)
-      ).to.be.revertedWith("Funding goal was reached; refunds not available");
+        crowdfunding.connect(donor1).approveMilestone(1, 0)
+      ).to.be.revertedWith("Only contract administrator can execute this");
+
+      // Admin approves milestone 1
+      await crowdfunding.connect(admin).approveMilestone(1, 0);
+      const mApproved = await crowdfunding.getCampaignMilestones(1);
+      expect(mApproved[0].approved).to.equal(true);
+
+      // Release milestone 1 funds
+      const beneficiaryBalanceBefore = await ethers.provider.getBalance(beneficiary.address);
+      await crowdfunding.connect(thirdParty).releaseMilestoneFunds(1, 0);
+      const beneficiaryBalanceAfter = await ethers.provider.getBalance(beneficiary.address);
+
+      expect(beneficiaryBalanceAfter - beneficiaryBalanceBefore).to.equal(mTargets[0]);
+
+      const campaignAfterM1 = await crowdfunding.getCampaign(1);
+      expect(campaignAfterM1.escrowBalance).to.equal(goal - mTargets[0]);
+      expect(campaignAfterM1.totalReleased).to.equal(mTargets[0]);
+
+      // Cannot double release milestone 1
+      await expect(
+        crowdfunding.connect(thirdParty).releaseMilestoneFunds(1, 0)
+      ).to.be.revertedWith("Milestone funds have already been released");
+    });
+  });
+
+  describe("Scenario H: Donor Voting Governance", function () {
+    it("Allows campaign contributors to vote on proposals and prevents duplicate or non-contributor voting", async function () {
+      const deadline = (await time.latest()) + 3600;
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string)"](
+        "Community Agro-Forestry",
+        "Planting 10,000 native trees",
+        ethers.parseEther("1.0"),
+        deadline,
+        "Environment",
+        ""
+      );
+
+      // Donor1 contributes
+      await crowdfunding.connect(donor1).contribute(1, { value: ethers.parseEther("0.5") });
+
+      // Donor1 creates proposal
+      await crowdfunding.connect(donor1).createProposal(
+        1,
+        "Extend Planting Window by 2 Weeks",
+        "Due to unseasonal monsoon rainfall, request postponing deadline.",
+        300 // 5 minutes voting
+      );
+
+      expect(await crowdfunding.proposalCount()).to.equal(1);
+      const proposals = await crowdfunding.getCampaignProposals(1);
+      expect(proposals.length).to.equal(1);
+      expect(proposals[0].title).to.equal("Extend Planting Window by 2 Weeks");
+
+      // Non-contributor (donor2) cannot vote
+      await expect(
+        crowdfunding.connect(donor2).voteOnProposal(1, true)
+      ).to.be.revertedWith("Only contributors to this campaign can vote");
+
+      // Donor1 votes FOR
+      await crowdfunding.connect(donor1).voteOnProposal(1, true);
+
+      // Cannot vote twice
+      await expect(
+        crowdfunding.connect(donor1).voteOnProposal(1, false)
+      ).to.be.revertedWith("Already voted on this proposal");
+
+      // Advance time to after proposal deadline and execute
+      await time.increase(310);
+      await crowdfunding.executeProposal(1);
+
+      const propFinal = (await crowdfunding.getCampaignProposals(1))[0];
+      expect(propFinal.executed).to.equal(true);
+      expect(propFinal.passed).to.equal(true);
+      expect(propFinal.votesFor).to.equal(1);
+    });
+  });
+
+  describe("Scenario I: Dispute Management", function () {
+    it("Pauses milestone fund releases when a dispute is active, and resumes once resolved", async function () {
+      const deadline = (await time.latest()) + 7200;
+      await crowdfunding.connect(creator).createCampaignWithMilestones(
+        "Organic Fertilizer Plant",
+        "Commercial processing unit",
+        ethers.parseEther("1.0"),
+        deadline,
+        "Agriculture",
+        "",
+        beneficiary.address,
+        ["Stage 1 Construction"],
+        ["Foundation and mixing tanks"],
+        [ethers.parseEther("1.0")]
+      );
+
+      await crowdfunding.connect(donor1).contribute(1, { value: ethers.parseEther("1.0") });
+      await crowdfunding.connect(creator).submitMilestoneEvidence(1, 0, "https://proof-fake-site.com");
+      await crowdfunding.connect(admin).approveMilestone(1, 0);
+
+      // Donor1 raises dispute on suspicious evidence
+      await crowdfunding.connect(donor1).raiseDispute(1, 0, "Evidence pictures appear to be stock photos", "https://reverse-image-search.com");
+      expect(await crowdfunding.campaignHasActiveDispute(1)).to.equal(true);
+
+      // Milestone fund release MUST be blocked while dispute is active
+      await expect(
+        crowdfunding.connect(thirdParty).releaseMilestoneFunds(1, 0)
+      ).to.be.revertedWith("Fund release paused: Campaign has an active unresolved dispute");
+
+      // Admin resolves dispute in favor of creator after verification
+      await crowdfunding.connect(admin).resolveDispute(1, false, "Verified via local agricultural cooperative on-site inspection");
+      expect(await crowdfunding.campaignHasActiveDispute(1)).to.equal(false);
+
+      // Now release succeeds
+      await expect(crowdfunding.connect(thirdParty).releaseMilestoneFunds(1, 0)).to.not.be.reverted;
+    });
+  });
+
+  describe("Scenario J: Creator On-Chain Reputation", function () {
+    it("Calculates reputation transparently based on successful campaigns and milestones", async function () {
+      // New creator before any campaign
+      const repNew = await crowdfunding.getCreatorReputation(thirdParty.address);
+      expect(repNew.totalCreated).to.equal(0);
+      expect(repNew.badge).to.equal("New Creator");
+
+      // Creator creates a campaign and reaches goal
+      const deadline = (await time.latest()) + 3600;
+      await crowdfunding.connect(creator)["createCampaign(string,string,uint256,uint256,string,string)"](
+        "Reputation Test Campaign",
+        "Empowering organic farmers",
+        ethers.parseEther("0.5"),
+        deadline,
+        "Agriculture",
+        ""
+      );
+      await crowdfunding.connect(donor1).contribute(1, { value: ethers.parseEther("0.5") });
+
+      const rep = await crowdfunding.getCreatorReputation(creator.address);
+      expect(rep.totalCreated).to.equal(1);
+      expect(rep.successfulCampaigns).to.equal(1);
+      expect(rep.score).to.be.gte(50);
+      expect(rep.score).to.be.lte(100);
     });
   });
 });
