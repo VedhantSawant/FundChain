@@ -29,14 +29,28 @@ import {
   CheckCircle2,
   RefreshCw,
   Wallet,
+  Bot,
+  PieChart,
+  BarChart3,
+  Scale,
+  FileCheck2,
+  AlertCircle,
+  Eye,
+  CheckCircle,
 } from "lucide-react";
 import { useWeb3 } from "../context/Web3Context";
 import { shortenAddress } from "../blockchain/contract";
 import { CONTRACT_ADDRESS, CHAIN_ID, SUPPORTED_NETWORKS } from "../blockchain/config";
+import { evaluateCampaignLocally } from "../services/aiFraudDetector";
+import ExpiryReleaseDemoModal from "../components/ExpiryReleaseDemoModal";
 
 export default function AdminDashboard() {
   const {
     account,
+    availableAccounts = [],
+    selectAccount,
+    chainId,
+    getAccountName,
     adminAddress,
     isAdmin,
     isConnected,
@@ -48,16 +62,22 @@ export default function AdminDashboard() {
     getPlatformStats,
     getAllContractEvents,
     getAllInteractingUsers,
+    getAllDisputes,
+    resolveDispute,
+    approveMilestone,
+    rejectMilestone,
     switchWallet,
     connectWallet,
     txState,
   } = useWeb3();
 
-  const [activeTab, setActiveTab] = useState("overview"); // overview, campaigns, escrow, users, transactions, settings
+  // Tabs: overview, campaigns, escrow, users, transactions, ai, disputes, analytics, settings
+  const [activeTab, setActiveTab] = useState("overview");
   const [copiedAddress, setCopiedAddress] = useState("");
   const [platformStats, setPlatformStats] = useState(null);
   const [contractEvents, setContractEvents] = useState([]);
   const [interactingUsers, setInteractingUsers] = useState([]);
+  const [allDisputes, setAllDisputes] = useState([]);
   const [loadingData, setLoadingData] = useState(true);
 
   // Filters & search
@@ -66,9 +86,20 @@ export default function AdminDashboard() {
   const [userSearch, setUserSearch] = useState("");
   const [txTypeFilter, setTxTypeFilter] = useState("all");
 
+  // AI Moderation review notes state (persisted in localStorage)
+  const [reviewedCampaigns, setReviewedCampaigns] = useState(() => {
+    try {
+      const stored = localStorage.getItem("fundchain_admin_reviewed_campaigns");
+      return stored ? JSON.parse(stored) : {};
+    } catch {
+      return {};
+    }
+  });
+
   // Fast forward state
   const [fastForwardLoading, setFastForwardLoading] = useState(false);
   const [fastForwardSuccess, setFastForwardSuccess] = useState("");
+  const [demoModalOpen, setDemoModalOpen] = useState(false);
 
   const handleCopy = (text) => {
     navigator.clipboard.writeText(text);
@@ -76,18 +107,20 @@ export default function AdminDashboard() {
     setTimeout(() => setCopiedAddress(""), 2000);
   };
 
-  // Fetch admin stats, events, and users
+  // Fetch admin stats, events, users, and disputes
   const loadAdminData = async () => {
     setLoadingData(true);
     try {
-      const [stats, events, users] = await Promise.all([
+      const [stats, events, users, disps] = await Promise.all([
         getPlatformStats(),
         getAllContractEvents(),
         getAllInteractingUsers(),
+        getAllDisputes ? getAllDisputes() : Promise.resolve([]),
       ]);
       setPlatformStats(stats);
-      setContractEvents(events);
-      setInteractingUsers(users);
+      setContractEvents(Array.isArray(events) ? events : []);
+      setInteractingUsers(users ? Array.from(users) : []);
+      setAllDisputes(disps ? Array.from(disps) : []);
     } catch (err) {
       console.warn("Error loading admin data:", err);
     } finally {
@@ -101,8 +134,12 @@ export default function AdminDashboard() {
     }
   }, [isAdmin, campaigns]);
 
-  // Handle fast-forward local time
+  // Handle fast-forward local time (development Hardhat network only)
   const handleFastForward = async (days) => {
+    if ((chainId || CHAIN_ID) !== 31337) {
+      alert("Time manipulation is disabled on non-local networks.");
+      return;
+    }
     setFastForwardLoading(true);
     setFastForwardSuccess("");
     try {
@@ -118,25 +155,63 @@ export default function AdminDashboard() {
     }
   };
 
-  // Handle manual release of funds from admin dashboard
-  const handleReleaseEscrow = async (campaignId) => {
+  // AI Moderation action
+  const handleModerateCampaign = (campaignId, action) => {
+    setReviewedCampaigns((prev) => {
+      const updated = { ...prev, [campaignId]: action };
+      try {
+        localStorage.setItem("fundchain_admin_reviewed_campaigns", JSON.stringify(updated));
+      } catch (e) {
+        console.warn(e);
+      }
+      return updated;
+    });
+  };
+
+  // Dispute resolution action
+  const handleAdminResolveDispute = async (disputeId, inFavorOfDonors) => {
+    const notes = window.prompt(
+      `Enter resolution justification (${inFavorOfDonors ? "In Favor of Donors" : "In Favor of Creator"}):`,
+      inFavorOfDonors ? "Evidence verified invalid; refunded" : "Deliverables verified by auditor"
+    );
+    if (!notes) return;
     try {
-      await releaseFunds(campaignId);
+      await resolveDispute(disputeId, inFavorOfDonors, notes);
       await loadAdminData();
+      await refreshCampaigns();
     } catch (err) {
-      console.error("Release error:", err);
+      alert("Dispute resolution failed: " + err.message);
     }
   };
 
-  // User activity mapping based on events and campaigns
-  const userMetrics = useMemo(() => {
+  // AI Scan of all campaigns
+  const aiEvaluatedCampaigns = useMemo(() => {
+    return campaigns.map((c) => {
+      const analysis = evaluateCampaignLocally({
+        title: c.title,
+        description: c.description,
+        goal: parseFloat(c.goal || 0),
+        category: c.category,
+        deadlineDays: Math.max(1, Math.round((c.deadline - c.createdAt) / 86400)),
+        existingCampaigns: campaigns.filter((other) => other.id !== c.id),
+      });
+      return {
+        ...c,
+        ai: analysis,
+        reviewStatus: reviewedCampaigns[c.id] || (analysis.isFlagged ? "Flagged for Review" : "Clear"),
+      };
+    });
+  }, [campaigns, reviewedCampaigns]);
+
+  // User details aggregation
+  const userDirectory = useMemo(() => {
     const map = {};
 
-    // Ensure all interacting users are initialized
-    for (const u of interactingUsers) {
-      const lower = u.toLowerCase();
+    for (const addr of interactingUsers) {
+      const lower = addr.toLowerCase();
       map[lower] = {
-        address: u,
+        address: addr,
+        name: getAccountName(addr),
         totalContributed: 0,
         contributionsCount: 0,
         campaignsCreated: 0,
@@ -153,6 +228,7 @@ export default function AdminDashboard() {
       if (!map[creatorLower]) {
         map[creatorLower] = {
           address: c.creator,
+          name: getAccountName(c.creator),
           totalContributed: 0,
           contributionsCount: 0,
           campaignsCreated: 0,
@@ -169,6 +245,7 @@ export default function AdminDashboard() {
       if (!map[benLower]) {
         map[benLower] = {
           address: c.beneficiary,
+          name: getAccountName(c.beneficiary),
           totalContributed: 0,
           contributionsCount: 0,
           campaignsCreated: 0,
@@ -191,6 +268,7 @@ export default function AdminDashboard() {
         if (!map[fromLower]) {
           map[fromLower] = {
             address: e.from,
+            name: getAccountName(e.from),
             totalContributed: 0,
             contributionsCount: 0,
             campaignsCreated: 0,
@@ -207,7 +285,7 @@ export default function AdminDashboard() {
     }
 
     return Object.values(map);
-  }, [interactingUsers, campaigns, contractEvents]);
+  }, [interactingUsers, campaigns, contractEvents, getAccountName]);
 
   // Filtered campaigns
   const filteredCampaigns = useMemo(() => {
@@ -220,29 +298,18 @@ export default function AdminDashboard() {
 
       const matchesStatus =
         campaignStatusFilter === "all" ||
-        c.status.toLowerCase() === campaignStatusFilter.toLowerCase() ||
-        (campaignStatusFilter === "awaiting" && c.canReleaseFunds);
+        (campaignStatusFilter === "active" && c.status === "Active") ||
+        (campaignStatusFilter === "achieved" && c.status === "Goal Achieved") ||
+        (campaignStatusFilter === "awaiting" && c.status === "Awaiting Release") ||
+        (campaignStatusFilter === "released" && c.status === "Funds Released") ||
+        (campaignStatusFilter === "refund" && c.status === "Refund Available") ||
+        (campaignStatusFilter === "refunded" && c.status === "Refunded");
 
       return matchesSearch && matchesStatus;
     });
   }, [campaigns, campaignSearch, campaignStatusFilter]);
 
-  // Filtered users
-  const filteredUsers = useMemo(() => {
-    return userMetrics.filter((u) =>
-      u.address.toLowerCase().includes(userSearch.toLowerCase())
-    );
-  }, [userMetrics, userSearch]);
-
-  // Filtered events
-  const filteredEvents = useMemo(() => {
-    return contractEvents.filter((e) => {
-      if (txTypeFilter === "all") return true;
-      return e.type.toLowerCase() === txTypeFilter.toLowerCase();
-    });
-  }, [contractEvents, txTypeFilter]);
-
-  // Aggregated campaign status counts for charts
+  // Status breakdown
   const statusCounts = useMemo(() => {
     const counts = {
       Active: 0,
@@ -263,19 +330,77 @@ export default function AdminDashboard() {
     return counts;
   }, [campaigns]);
 
+  // Category breakdown for analytics
+  const categoryCounts = useMemo(() => {
+    const counts = {};
+    for (const c of campaigns) {
+      counts[c.category] = (counts[c.category] || 0) + 1;
+    }
+    return counts;
+  }, [campaigns]);
+
+  // AI Risk distribution for analytics
+  const aiRiskCounts = useMemo(() => {
+    const counts = { LOW: 0, MEDIUM: 0, HIGH: 0 };
+    for (const c of aiEvaluatedCampaigns) {
+      counts[c.ai.riskLevel] = (counts[c.ai.riskLevel] || 0) + 1;
+    }
+    return counts;
+  }, [aiEvaluatedCampaigns]);
+
   // Calculated totals
   const totalEscrowLocked = platformStats ? platformStats.totalEscrowLocked : "0.0";
   const totalReleased = platformStats ? platformStats.totalReleased : "0.0";
   const totalRefunded = platformStats ? platformStats.totalRefunded : "0.0";
   const totalContributions = platformStats ? platformStats.totalContributions : "0.0";
 
-  // If user is not admin or not connected
+  // Capital settlement proportions for analytics chart
+  const capitalTotal =
+    parseFloat(totalEscrowLocked || 0) +
+    parseFloat(totalReleased || 0) +
+    parseFloat(totalRefunded || 0);
+  const escrowPct = capitalTotal > 0 ? Math.round((parseFloat(totalEscrowLocked) / capitalTotal) * 100) : 0;
+  const releasedPct = capitalTotal > 0 ? Math.round((parseFloat(totalReleased) / capitalTotal) * 100) : 0;
+  const refundedPct = capitalTotal > 0 ? Math.round((parseFloat(totalRefunded) / capitalTotal) * 100) : 0;
+
+  // Contributions over time derived from on-chain events
+  const contributionTimeline = useMemo(() => {
+    const contribs = contractEvents
+      .filter((e) => e.type === "ContributionReceived")
+      .slice()
+      .reverse();
+    const maxAmt = contribs.reduce((m, e) => Math.max(m, parseFloat(e.amount || 0)), 0) || 1;
+    return contribs.slice(-8).map((e, idx) => ({
+      id: idx,
+      campaignId: e.campaignId,
+      amount: parseFloat(e.amount || 0),
+      pct: Math.max(8, Math.round((parseFloat(e.amount || 0) / maxAmt) * 100)),
+      label: `#${e.campaignId} · ${shortenAddress(e.from)}`,
+      date: new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    }));
+  }, [contractEvents]);
+
+  const handleSwitchToAdmin = async () => {
+    try {
+      const targetAdmin = (adminAddress || "").toLowerCase();
+      if (targetAdmin && availableAccounts.some((a) => a.toLowerCase() === targetAdmin)) {
+        const match = availableAccounts.find((a) => a.toLowerCase() === targetAdmin);
+        await selectAccount(match);
+      } else {
+        await switchWallet();
+      }
+    } catch (err) {
+      console.warn("Switch to admin wallet failed:", err);
+    }
+  };
+
+  // Access denied guard
   if (!isConnected || !isAdmin) {
     return (
       <div className="max-w-4xl mx-auto px-4 py-16 sm:py-24">
         <div className="bg-white rounded-3xl p-8 sm:p-12 shadow-xl border border-rose-100 text-center relative overflow-hidden">
           <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-rose-500 via-amber-500 to-rose-600" />
-          
+
           <div className="w-20 h-20 bg-rose-50 rounded-2xl flex items-center justify-center mx-auto mb-6 text-rose-600 ring-8 ring-rose-50/50">
             <ShieldAlert className="w-10 h-10" />
           </div>
@@ -284,22 +409,21 @@ export default function AdminDashboard() {
             Restricted Administrator Access
           </h1>
           <p className="text-gray-600 text-sm sm:text-base max-w-lg mx-auto mb-8">
-            The FundChain Admin Dashboard provides privileged on-chain monitoring and escrow settlement oversight. Your currently connected wallet is not authorized as the contract administrator.
+            The FundChain Admin Dashboard provides privileged on-chain monitoring, AI fraud detection oversight, and escrow arbitration. Your currently connected wallet is not authorized as the contract administrator.
           </p>
 
-          {/* Account Comparison Card */}
           <div className="bg-gray-50 rounded-2xl p-5 max-w-lg mx-auto text-left space-y-3 border border-gray-200/80 mb-8 font-mono text-xs">
             <div>
               <span className="text-gray-500 block font-sans font-semibold mb-1">
                 Connected Wallet:
               </span>
               <span className="text-gray-800 break-all bg-white p-2 rounded-lg border border-gray-200 block">
-                {account ? account : "No wallet connected"}
+                {account ? `${account} (${getAccountName(account)})` : "No wallet connected"}
               </span>
             </div>
             <div>
               <span className="text-gray-500 block font-sans font-semibold mb-1">
-                Authorized Admin Address:
+                Designated Admin Address:
               </span>
               <span className="text-emerald-700 font-bold break-all bg-emerald-50/60 p-2 rounded-lg border border-emerald-100 block">
                 {adminAddress ? adminAddress : "Loading on-chain admin..."}
@@ -307,12 +431,11 @@ export default function AdminDashboard() {
             </div>
           </div>
 
-          {/* Actions */}
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
             {isConnected ? (
               <button
-                onClick={switchWallet}
-                className="w-full sm:w-auto px-6 py-3 bg-[#14532D] hover:bg-[#0f3e21] text-white font-bold rounded-xl text-sm shadow-md transition-all flex items-center justify-center gap-2"
+                onClick={handleSwitchToAdmin}
+                className="w-full sm:w-auto px-6 py-3 bg-[#14532D] hover:bg-[#0f3e21] text-white font-bold rounded-xl text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
                 <Wallet className="w-4 h-4" />
                 <span>Switch to Admin Wallet</span>
@@ -327,10 +450,10 @@ export default function AdminDashboard() {
               </button>
             )}
             <Link
-              to="/"
-              className="w-full sm:w-auto px-6 py-3 bg-white hover:bg-gray-50 text-gray-700 font-bold rounded-xl text-sm border border-gray-200 transition-all flex items-center justify-center gap-2"
+              to="/explore"
+              className="w-full sm:w-auto px-6 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold rounded-xl text-sm transition-all"
             >
-              <span>Back to Home</span>
+              Back to Explore
             </Link>
           </div>
         </div>
@@ -338,891 +461,927 @@ export default function AdminDashboard() {
     );
   }
 
+  const network = SUPPORTED_NETWORKS[chainId || CHAIN_ID];
+  const explorerUrl = network?.blockExplorer;
+  const isLocalDevNetwork = (chainId || CHAIN_ID) === 31337;
+
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8 animate-fade-in">
-      {/* Admin Header */}
-      <div className="bg-gradient-to-br from-[#14532D] via-[#166534] to-[#15803D] rounded-3xl p-6 sm:p-8 text-white shadow-xl relative overflow-hidden">
-        <div className="absolute right-0 top-0 bottom-0 w-96 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-white/10 via-transparent to-transparent pointer-events-none" />
-        
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 relative z-10">
-          <div className="space-y-2">
-            <div className="flex items-center gap-2.5">
-              <span className="bg-emerald-400/20 text-emerald-200 border border-emerald-400/30 text-xs font-bold px-3 py-1 rounded-full uppercase tracking-wider flex items-center gap-1.5">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
-                Administrator Console
-              </span>
-              <span className="text-emerald-200 text-xs font-medium">
-                Smart Contract Escrow Monitor
-              </span>
-            </div>
-            <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
-              FundChain Protocol Governance
-            </h1>
-            <p className="text-emerald-100/90 text-sm max-w-2xl">
-              Real-time oversight of smart contract escrow balances, campaign conditions, automated beneficiary fund releases, and contributor refund verification.
-            </p>
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-10">
+      {/* Admin Header Banner */}
+      <div className="bg-white rounded-3xl border border-gray-200/80 p-6 sm:p-8 shadow-soft flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative overflow-hidden">
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-xs font-semibold text-emerald-800 bg-emerald-100 px-3 py-1 rounded-full w-fit">
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
+            <span>FundChain 3.0 · Protocol Administration</span>
           </div>
-
-          {/* Quick Admin Wallet & Refresh */}
-          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
-            <div className="bg-white/10 backdrop-blur-md border border-white/20 p-3 rounded-2xl flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center text-white">
-                <Shield className="w-5 h-5 text-emerald-200" />
-              </div>
-              <div>
-                <p className="text-[11px] text-emerald-200 font-semibold uppercase tracking-wider">
-                  Admin Wallet
-                </p>
-                <div className="flex items-center gap-2 font-mono text-xs font-bold text-white">
-                  <span>{shortenAddress(account)}</span>
-                  <button
-                    onClick={() => handleCopy(account)}
-                    className="hover:text-emerald-300 transition-colors"
-                  >
-                    {copiedAddress === account ? (
-                      <Check className="w-3.5 h-3.5 text-emerald-300" />
-                    ) : (
-                      <Copy className="w-3.5 h-3.5" />
-                    )}
-                  </button>
-                </div>
-              </div>
-            </div>
-
+          <h1 className="text-2xl sm:text-3xl font-black text-gray-900 tracking-tight">
+            Administrator Control Console
+          </h1>
+          <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-gray-600">
+            <span>Admin Wallet: <strong>{shortenAddress(account)}</strong></span>
             <button
-              onClick={() => {
-                refreshCampaigns();
-                loadAdminData();
-              }}
-              className="p-3 bg-white/15 hover:bg-white/25 rounded-2xl text-white transition-all self-stretch sm:self-auto flex items-center justify-center"
-              title="Refresh blockchain data"
+              onClick={() => handleCopy(account)}
+              className="text-gray-400 hover:text-emerald-700 p-1"
+              title="Copy"
             >
-              <RefreshCw className={`w-5 h-5 ${loadingData ? "animate-spin" : ""}`} />
+              {copiedAddress === account ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
             </button>
+            <span className="text-gray-300">|</span>
+            <span className="text-emerald-700 font-sans font-bold bg-emerald-50 px-2 py-0.5 rounded">
+              Contract Verified On-Chain
+            </span>
           </div>
         </div>
 
-        {/* Dedicated Escrow Security Notice */}
-        <div className="mt-6 pt-5 border-t border-white/15 flex flex-col sm:flex-row sm:items-center justify-between text-xs text-emerald-100/80 gap-3">
-          <div className="flex items-center gap-2">
-            <Lock className="w-4 h-4 text-emerald-300 shrink-0" />
-            <span>
-              <strong>Escrow Custody:</strong> All donor funds are locked in the autonomous Smart Contract ({shortenAddress(CONTRACT_ADDRESS)}). The admin cannot arbitrarily withdraw or transfer donor funds.
-            </span>
-          </div>
+        <div className="flex flex-wrap items-center gap-2.5">
           <button
-            onClick={() => handleCopy(CONTRACT_ADDRESS)}
-            className="flex items-center gap-1.5 text-white hover:text-emerald-200 font-mono underline shrink-0 font-medium"
+            onClick={() => loadAdminData()}
+            className="px-3.5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+            title="Refresh on-chain data"
           >
-            <span>Contract: {shortenAddress(CONTRACT_ADDRESS)}</span>
-            <Copy className="w-3 h-3" />
+            <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? "animate-spin" : ""}`} />
+            <span>Sync Chain</span>
+          </button>
+          <button
+            onClick={() => setDemoModalOpen(true)}
+            disabled={!isLocalDevNetwork}
+            className="px-4 py-2.5 bg-gradient-to-r from-[#D4A017] to-amber-600 hover:opacity-95 disabled:opacity-50 text-white rounded-xl text-xs font-extrabold transition-all shadow-sm flex items-center gap-1.5 cursor-pointer"
+            title={
+              isLocalDevNetwork
+                ? "Demonstrate 7-day campaign expiry and on-chain escrow release"
+                : "Development demo disabled on non-local networks"
+            }
+          >
+            <Clock className="w-3.5 h-3.5" />
+            <span>Simulate Campaign Expiry & Release Funds</span>
+          </button>
+          <button
+            onClick={() => handleFastForward(7)}
+            disabled={fastForwardLoading || !isLocalDevNetwork}
+            className="px-4 py-2.5 bg-[#14532D] hover:bg-emerald-800 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5 cursor-pointer"
+            title={
+              isLocalDevNetwork
+                ? "Advance local EVM by 7 days for deadline testing"
+                : "Disabled on production/non-local networks"
+            }
+          >
+            <FastForward className="w-3.5 h-3.5" />
+            <span>Fast-Forward +7d</span>
           </button>
         </div>
       </div>
 
-      {/* Navigation Tabs */}
-      <div className="border-b border-gray-200">
-        <nav className="flex space-x-2 sm:space-x-4 overflow-x-auto pb-px">
-          {[
-            { id: "overview", label: "Overview", icon: Layers },
-            { id: "campaigns", label: `Campaigns (${campaigns.length})`, icon: TrendingUp },
-            { id: "escrow", label: "Escrow Monitoring", icon: Lock },
-            { id: "users", label: `Wallets (${interactingUsers.length})`, icon: Users },
-            { id: "transactions", label: `Transactions (${contractEvents.length})`, icon: History },
-            { id: "settings", label: "Settings & Dev Tools", icon: Settings },
-          ].map((tab) => {
-            const Icon = tab.icon;
-            const isActive = activeTab === tab.id;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center gap-2 py-3 px-4 border-b-2 font-bold text-xs sm:text-sm whitespace-nowrap transition-all cursor-pointer ${
-                  isActive
-                    ? "border-emerald-600 text-emerald-800 bg-emerald-50/50 rounded-t-xl"
-                    : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-                }`}
-              >
-                <Icon className={`w-4 h-4 ${isActive ? "text-emerald-600" : "text-gray-400"}`} />
-                <span>{tab.label}</span>
-              </button>
-            );
-          })}
-        </nav>
+      {fastForwardSuccess && (
+        <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-2xl flex items-center gap-2 animate-fade-in font-bold">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span>{fastForwardSuccess}</span>
+        </div>
+      )}
+
+      {/* Navigation Tabs Bar */}
+      <div className="flex border-b border-gray-200 bg-white rounded-2xl p-1.5 shadow-soft overflow-x-auto text-xs font-bold">
+        {[
+          { id: "overview", label: "Overview & Metrics", icon: Layers },
+          { id: "campaigns", label: `Campaigns (${campaigns.length})`, icon: Coins },
+          { id: "escrow", label: "Escrow Vault", icon: Lock },
+          { id: "users", label: `User Directory (${interactingUsers.length})`, icon: Users },
+          { id: "transactions", label: `Tx Logs (${contractEvents.length})`, icon: History },
+          { id: "ai", label: `AI Fraud Engine (${aiEvaluatedCampaigns.length})`, icon: Bot },
+          { id: "disputes", label: `Disputes (${allDisputes.length})`, icon: Scale },
+          { id: "analytics", label: "Visual Analytics", icon: BarChart3 },
+          { id: "settings", label: "Settings & Dev Tools", icon: Settings },
+        ].map((tab) => {
+          const Icon = tab.icon;
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex items-center gap-2 px-4 py-3 rounded-xl transition-all whitespace-nowrap cursor-pointer ${
+                isActive
+                  ? "bg-[#14532D] text-white shadow-sm"
+                  : "text-gray-600 hover:text-gray-900 hover:bg-gray-100/70"
+              }`}
+            >
+              <Icon className="w-4 h-4" />
+              <span>{tab.label}</span>
+            </button>
+          );
+        })}
       </div>
 
-      {/* TAB 1: OVERVIEW */}
+      {/* ==================== TAB 1: OVERVIEW ==================== */}
       {activeTab === "overview" && (
         <div className="space-y-8 animate-fade-in">
-          {/* Key Metric KPI Cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-1">
-              <div className="flex justify-between items-center text-gray-500 text-xs font-semibold uppercase tracking-wider">
-                <span>Total Campaigns</span>
-                <Layers className="w-4 h-4 text-emerald-600" />
+          {/* Top Macro Stats Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+            <div className="bg-white p-5 rounded-2xl border border-gray-200/80 shadow-soft space-y-1">
+              <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block">
+                Total Locked in Escrow
+              </span>
+              <p className="text-2xl font-black text-emerald-700">
+                {totalEscrowLocked} <span className="text-xs text-gray-500 font-normal">ETH</span>
+              </p>
+              <span className="text-[11px] text-gray-500">Held in contract bytecode</span>
+            </div>
+
+            <div className="bg-white p-5 rounded-2xl border border-gray-200/80 shadow-soft space-y-1">
+              <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block">
+                Total All-Time Contributions
+              </span>
+              <p className="text-2xl font-black text-gray-900">
+                {totalContributions} <span className="text-xs text-gray-500 font-normal">ETH</span>
+              </p>
+              <span className="text-[11px] text-gray-500">Across {campaigns.length} campaigns</span>
+            </div>
+
+            <div className="bg-white p-5 rounded-2xl border border-gray-200/80 shadow-soft space-y-1">
+              <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block">
+                Released to Beneficiaries
+              </span>
+              <p className="text-2xl font-black text-teal-700">
+                {totalReleased} <span className="text-xs text-gray-500 font-normal">ETH</span>
+              </p>
+              <span className="text-[11px] text-teal-600 font-medium">Successfully disbursed</span>
+            </div>
+
+            <div className="bg-white p-5 rounded-2xl border border-gray-200/80 shadow-soft space-y-1">
+              <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block">
+                Refunds Claimed
+              </span>
+              <p className="text-2xl font-black text-amber-700">
+                {totalRefunded} <span className="text-xs text-gray-500 font-normal">ETH</span>
+              </p>
+              <span className="text-[11px] text-amber-600 font-medium">100% contributor protection</span>
+            </div>
+          </div>
+
+          {/* Status Breakdown & Live Charts Summary */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-4">
+              <h3 className="text-base font-bold text-gray-900 flex items-center gap-2">
+                <PieChart className="w-4 h-4 text-emerald-600" />
+                <span>Campaign State Lifecycle Distribution</span>
+              </h3>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <div className="p-3.5 bg-blue-50/60 rounded-xl border border-blue-100">
+                  <span className="text-[10px] font-bold text-blue-700 uppercase">Active</span>
+                  <p className="text-xl font-black text-blue-900">{statusCounts.Active}</p>
+                </div>
+                <div className="p-3.5 bg-emerald-50/60 rounded-xl border border-emerald-100">
+                  <span className="text-[10px] font-bold text-emerald-700 uppercase">Goal Reached</span>
+                  <p className="text-xl font-black text-emerald-900">{statusCounts.GoalAchieved}</p>
+                </div>
+                <div className="p-3.5 bg-indigo-50/60 rounded-xl border border-indigo-100">
+                  <span className="text-[10px] font-bold text-indigo-700 uppercase">Awaiting Release</span>
+                  <p className="text-xl font-black text-indigo-900">{statusCounts.AwaitingRelease}</p>
+                </div>
+                <div className="p-3.5 bg-teal-50/60 rounded-xl border border-teal-100">
+                  <span className="text-[10px] font-bold text-teal-700 uppercase">Funds Released</span>
+                  <p className="text-xl font-black text-teal-900">{statusCounts.FundsReleased}</p>
+                </div>
+                <div className="p-3.5 bg-amber-50/60 rounded-xl border border-amber-100">
+                  <span className="text-[10px] font-bold text-amber-700 uppercase">Refund Available</span>
+                  <p className="text-xl font-black text-amber-900">{statusCounts.RefundAvailable}</p>
+                </div>
+                <div className="p-3.5 bg-gray-100 rounded-xl border border-gray-200">
+                  <span className="text-[10px] font-bold text-gray-600 uppercase">Refunded</span>
+                  <p className="text-xl font-black text-gray-800">{statusCounts.Refunded}</p>
+                </div>
               </div>
-              <p className="text-3xl font-extrabold text-gray-900">{campaigns.length}</p>
+            </div>
+
+            <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-4">
+              <h3 className="text-base font-bold text-gray-900 flex items-center gap-2">
+                <Bot className="w-4 h-4 text-emerald-600" />
+                <span>AI Risk Distribution</span>
+              </h3>
+              <div className="space-y-3 text-xs">
+                <div>
+                  <div className="flex justify-between font-semibold mb-1">
+                    <span className="text-emerald-700">Low Risk (Authentic)</span>
+                    <span>{aiRiskCounts.LOW} campaigns</span>
+                  </div>
+                  <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
+                    <div
+                      className="bg-emerald-600 h-full"
+                      style={{
+                        width: `${(aiRiskCounts.LOW / (campaigns.length || 1)) * 100}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between font-semibold mb-1">
+                    <span className="text-amber-700">Medium Risk (Review)</span>
+                    <span>{aiRiskCounts.MEDIUM} campaigns</span>
+                  </div>
+                  <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
+                    <div
+                      className="bg-amber-500 h-full"
+                      style={{
+                        width: `${(aiRiskCounts.MEDIUM / (campaigns.length || 1)) * 100}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between font-semibold mb-1">
+                    <span className="text-rose-700">High Risk (Flagged)</span>
+                    <span>{aiRiskCounts.HIGH} campaigns</span>
+                  </div>
+                  <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
+                    <div
+                      className="bg-rose-600 h-full"
+                      style={{
+                        width: `${(aiRiskCounts.HIGH / (campaigns.length || 1)) * 100}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-gray-100">
+                  <button
+                    onClick={() => setActiveTab("ai")}
+                    className="w-full py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-xl font-bold text-xs flex items-center justify-center gap-1 transition-colors"
+                  >
+                    <span>View AI Risk Inspector</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== TAB 2: CAMPAIGNS ==================== */}
+      {activeTab === "campaigns" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-5 animate-fade-in">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+            <div className="relative flex-1 max-w-md">
+              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search campaigns by title, creator, or beneficiary..."
+                value={campaignSearch}
+                onChange={(e) => setCampaignSearch(e.target.value)}
+                className="w-full pl-10 pr-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs focus:outline-hidden focus:ring-1 focus:ring-emerald-500"
+              />
+            </div>
+            <select
+              value={campaignStatusFilter}
+              onChange={(e) => setCampaignStatusFilter(e.target.value)}
+              className="px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-700"
+            >
+              <option value="all">All Campaign Statuses</option>
+              <option value="active">Active Only</option>
+              <option value="achieved">Goal Achieved</option>
+              <option value="awaiting">Awaiting Release</option>
+              <option value="released">Funds Released</option>
+              <option value="refund">Refund Available</option>
+            </select>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-gray-100 font-bold text-gray-400 uppercase tracking-wider">
+                  <th className="pb-3">ID & Title</th>
+                  <th className="pb-3">Category</th>
+                  <th className="pb-3">Creator / Beneficiary</th>
+                  <th className="pb-3">Raised / Goal</th>
+                  <th className="pb-3">Escrow Balance</th>
+                  <th className="pb-3">Status</th>
+                  <th className="pb-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {filteredCampaigns.map((c) => (
+                  <tr key={c.id} className="hover:bg-gray-50/50">
+                    <td className="py-3.5 font-bold text-gray-900 max-w-[200px] truncate">
+                      <Link to={`/campaign/${c.id}`} className="hover:text-emerald-700">
+                        #{c.id} · {c.title}
+                      </Link>
+                    </td>
+                    <td className="py-3.5 text-gray-600">{c.category}</td>
+                    <td className="py-3.5 font-mono text-[11px] text-gray-600">
+                      <div>Creator: {shortenAddress(c.creator)}</div>
+                      <div className="text-teal-700">Beneficiary: {shortenAddress(c.beneficiary)}</div>
+                    </td>
+                    <td className="py-3.5 font-semibold text-gray-900">
+                      {c.amountRaised} / {c.goal} ETH
+                    </td>
+                    <td className="py-3.5 font-extrabold text-emerald-700">
+                      {c.escrowBalance} ETH
+                    </td>
+                    <td className="py-3.5">
+                      <span className="px-2 py-0.5 rounded font-bold text-[10px] bg-gray-100 text-gray-700">
+                        {c.status}
+                      </span>
+                    </td>
+                    <td className="py-3.5 text-right">
+                      {c.canReleaseFunds ? (
+                        <button
+                          onClick={async () => {
+                            if (window.confirm(`Release ${c.amountRaised} ETH to beneficiary?`)) {
+                              await releaseFunds(c.id);
+                              await loadAdminData();
+                            }
+                          }}
+                          className="px-2.5 py-1 bg-[#14532D] text-white rounded-lg font-bold text-[11px] hover:bg-emerald-800"
+                        >
+                          Release
+                        </button>
+                      ) : (
+                        <Link to={`/campaign/${c.id}`} className="text-emerald-700 font-bold hover:underline">
+                          View
+                        </Link>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== TAB 3: ESCROW VAULT ==================== */}
+      {activeTab === "escrow" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-6 animate-fade-in">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">
+              Smart Contract Escrow Vault Management
+            </h3>
+            <p className="text-xs text-gray-500">
+              All contributor ETH is strictly held in the contract bytecode escrow balance until on-chain invariants are met.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="p-4 bg-emerald-50 rounded-2xl border border-emerald-100">
+              <span className="text-xs text-gray-500 font-bold block">Aggregated Vault Escrow</span>
+              <span className="text-2xl font-black text-emerald-800">{totalEscrowLocked} ETH</span>
+            </div>
+            <div className="p-4 bg-teal-50 rounded-2xl border border-teal-100">
+              <span className="text-xs text-gray-500 font-bold block">Total Disbursed to Beneficiaries</span>
+              <span className="text-2xl font-black text-teal-800">{totalReleased} ETH</span>
+            </div>
+            <div className="p-4 bg-amber-50 rounded-2xl border border-amber-100">
+              <span className="text-xs text-gray-500 font-bold block">Total Refunds Returned</span>
+              <span className="text-2xl font-black text-amber-800">{totalRefunded} ETH</span>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <h4 className="font-bold text-sm text-gray-800">Campaign Escrow Vault Breakdown</h4>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-gray-100 font-bold text-gray-400 uppercase">
+                    <th className="pb-3">Campaign</th>
+                    <th className="pb-3">Escrow Balance</th>
+                    <th className="pb-3">Total Released</th>
+                    <th className="pb-3">Total Refunded</th>
+                    <th className="pb-3">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {campaigns.map((c) => (
+                    <tr key={c.id}>
+                      <td className="py-3 font-semibold text-gray-900">
+                        #{c.id} · {c.title}
+                      </td>
+                      <td className="py-3 font-extrabold text-emerald-700">{c.escrowBalance} ETH</td>
+                      <td className="py-3 font-bold text-teal-700">{c.totalReleased} ETH</td>
+                      <td className="py-3 font-bold text-amber-700">{c.totalRefunded} ETH</td>
+                      <td className="py-3">
+                        <span className="px-2 py-0.5 rounded font-bold text-[10px] bg-gray-100 text-gray-700">
+                          {c.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== TAB 4: USERS ==================== */}
+      {activeTab === "users" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-5 animate-fade-in">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-lg font-bold text-gray-900">
+                User & Wallet Management
+              </h3>
               <p className="text-xs text-gray-500">
-                {statusCounts.Active} Active &bull; {statusCounts.FundsReleased} Released
+                All interacting Ethereum addresses verified on the blockchain ledger.
               </p>
             </div>
-
-            <div className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-1">
-              <div className="flex justify-between items-center text-gray-500 text-xs font-semibold uppercase tracking-wider">
-                <span>ETH in Escrow</span>
-                <Lock className="w-4 h-4 text-emerald-600" />
-              </div>
-              <p className="text-3xl font-extrabold text-emerald-800">{totalEscrowLocked} ETH</p>
-              <p className="text-xs text-emerald-600 font-medium">Secured in smart contract</p>
-            </div>
-
-            <div className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-1">
-              <div className="flex justify-between items-center text-gray-500 text-xs font-semibold uppercase tracking-wider">
-                <span>Funds Released</span>
-                <Unlock className="w-4 h-4 text-teal-600" />
-              </div>
-              <p className="text-3xl font-extrabold text-teal-800">{totalReleased} ETH</p>
-              <p className="text-xs text-teal-600 font-medium">Paid out to beneficiaries</p>
-            </div>
-
-            <div className="bg-white p-5 rounded-3xl border border-gray-100 shadow-sm space-y-1">
-              <div className="flex justify-between items-center text-gray-500 text-xs font-semibold uppercase tracking-wider">
-                <span>Funds Refunded</span>
-                <RotateCcw className="w-4 h-4 text-amber-600" />
-              </div>
-              <p className="text-3xl font-extrabold text-amber-800">{totalRefunded} ETH</p>
-              <p className="text-xs text-amber-600 font-medium">Returned to donors</p>
+            <div className="relative max-w-xs">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search user..."
+                value={userSearch}
+                onChange={(e) => setUserSearch(e.target.value)}
+                className="pl-9 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs"
+              />
             </div>
           </div>
 
-          {/* Secondary Stats */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div className="bg-emerald-50/60 p-4 rounded-2xl border border-emerald-100 flex items-center justify-between">
-              <div>
-                <p className="text-xs text-emerald-800 font-medium">Cumulative Contributed</p>
-                <p className="text-xl font-bold text-emerald-950">{totalContributions} ETH</p>
-              </div>
-              <Coins className="w-6 h-6 text-emerald-600" />
-            </div>
-
-            <div className="bg-blue-50/60 p-4 rounded-2xl border border-blue-100 flex items-center justify-between">
-              <div>
-                <p className="text-xs text-blue-800 font-medium">Interacting Wallets</p>
-                <p className="text-xl font-bold text-blue-950">{interactingUsers.length} Unique</p>
-              </div>
-              <Users className="w-6 h-6 text-blue-600" />
-            </div>
-
-            <div className="bg-purple-50/60 p-4 rounded-2xl border border-purple-100 flex items-center justify-between">
-              <div>
-                <p className="text-xs text-purple-800 font-medium">On-Chain Protocol Events</p>
-                <p className="text-xl font-bold text-purple-950">{contractEvents.length} Recorded</p>
-              </div>
-              <History className="w-6 h-6 text-purple-600" />
-            </div>
-          </div>
-
-          {/* Charts & Visual Breakdowns */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Escrow Distribution Chart */}
-            <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm space-y-4">
-              <div className="flex justify-between items-center">
-                <h3 className="font-extrabold text-base text-gray-900">
-                  Escrow Capital Allocation
-                </h3>
-                <span className="text-xs text-gray-500 font-medium">Live On-Chain Balance</span>
-              </div>
-
-              {/* Visual Segment Bar */}
-              {parseFloat(totalContributions) > 0 ? (
-                <div className="space-y-4">
-                  <div className="h-6 w-full bg-gray-100 rounded-xl overflow-hidden flex shadow-inner">
-                    <div
-                      style={{
-                        width: `${Math.max(
-                          2,
-                          (parseFloat(totalEscrowLocked) / Math.max(0.0001, parseFloat(totalContributions))) * 100
-                        )}%`,
-                      }}
-                      className="bg-emerald-600 h-full transition-all"
-                      title={`Locked in Escrow: ${totalEscrowLocked} ETH`}
-                    />
-                    <div
-                      style={{
-                        width: `${Math.max(
-                          2,
-                          (parseFloat(totalReleased) / Math.max(0.0001, parseFloat(totalContributions))) * 100
-                        )}%`,
-                      }}
-                      className="bg-teal-500 h-full transition-all"
-                      title={`Released: ${totalReleased} ETH`}
-                    />
-                    <div
-                      style={{
-                        width: `${Math.max(
-                          2,
-                          (parseFloat(totalRefunded) / Math.max(0.0001, parseFloat(totalContributions))) * 100
-                        )}%`,
-                      }}
-                      className="bg-amber-500 h-full transition-all"
-                      title={`Refunded: ${totalRefunded} ETH`}
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-3 pt-2 text-xs">
-                    <div className="border-l-3 border-emerald-600 pl-3">
-                      <p className="text-gray-500">Locked in Escrow</p>
-                      <p className="font-bold text-gray-900">{totalEscrowLocked} ETH</p>
-                    </div>
-                    <div className="border-l-3 border-teal-500 pl-3">
-                      <p className="text-gray-500">Released to Beneficiaries</p>
-                      <p className="font-bold text-gray-900">{totalReleased} ETH</p>
-                    </div>
-                    <div className="border-l-3 border-amber-500 pl-3">
-                      <p className="text-gray-500">Refunded to Donors</p>
-                      <p className="font-bold text-gray-900">{totalRefunded} ETH</p>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="py-8 text-center text-gray-400 text-xs">
-                  No contributions recorded yet. Escrow capital allocation will render here.
-                </div>
-              )}
-            </div>
-
-            {/* Campaign Status Distribution */}
-            <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm space-y-4">
-              <div className="flex justify-between items-center">
-                <h3 className="font-extrabold text-base text-gray-900">
-                  Campaign Status Lifecycle
-                </h3>
-                <span className="text-xs text-gray-500 font-medium">
-                  {campaigns.length} Total Campaigns
-                </span>
-              </div>
-
-              <div className="space-y-2.5 pt-1 text-xs">
-                {[
-                  { label: "Active (Accepting Contributions)", count: statusCounts.Active, color: "bg-blue-500" },
-                  { label: "Goal Achieved (Funds Locked)", count: statusCounts.GoalAchieved, color: "bg-emerald-500" },
-                  { label: "Awaiting Release (Deadline Passed)", count: statusCounts.AwaitingRelease, color: "bg-indigo-500" },
-                  { label: "Funds Released (Beneficiary Paid)", count: statusCounts.FundsReleased, color: "bg-teal-600" },
-                  { label: "Refund Available (Failed Goal)", count: statusCounts.RefundAvailable, color: "bg-amber-500" },
-                  { label: "Refunded (Completed)", count: statusCounts.Refunded, color: "bg-gray-400" },
-                ].map((s) => {
-                  const pct =
-                    campaigns.length > 0 ? Math.round((s.count / campaigns.length) * 100) : 0;
-                  return (
-                    <div key={s.label} className="space-y-1">
-                      <div className="flex justify-between font-medium">
-                        <span className="text-gray-700">{s.label}</span>
-                        <span className="text-gray-500 font-mono font-bold">
-                          {s.count} ({pct}%)
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-gray-100 font-bold text-gray-400 uppercase">
+                  <th className="pb-3">User & Label</th>
+                  <th className="pb-3">Role</th>
+                  <th className="pb-3">Campaigns Launched</th>
+                  <th className="pb-3">Total ETH Contributed</th>
+                  <th className="pb-3">Beneficiary Payouts</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {userDirectory
+                  .filter((u) => u.address.toLowerCase().includes(userSearch.toLowerCase()) || u.name.toLowerCase().includes(userSearch.toLowerCase()))
+                  .map((u) => (
+                    <tr key={u.address} className="hover:bg-gray-50/50">
+                      <td className="py-3">
+                        <div className="font-bold text-gray-900 text-xs">{u.name}</div>
+                        <div className="font-mono text-gray-500 text-[11px]">{shortenAddress(u.address)}</div>
+                      </td>
+                      <td className="py-3">
+                        <span className="px-2 py-0.5 rounded font-bold text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-200">
+                          {u.address.toLowerCase() === adminAddress?.toLowerCase()
+                            ? "Protocol Admin"
+                            : u.isCreator
+                            ? "Creator"
+                            : u.isContributor
+                            ? "Donor / Backer"
+                            : "Vault Depositor"}
                         </span>
+                      </td>
+                      <td className="py-3 font-semibold text-gray-900">{u.campaignsCreated}</td>
+                      <td className="py-3 font-extrabold text-emerald-700">{u.totalContributed.toFixed(3)} ETH</td>
+                      <td className="py-3 font-bold text-teal-700">{u.totalReceivedAsBeneficiary.toFixed(3)} ETH</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== TAB 5: TRANSACTIONS ==================== */}
+      {activeTab === "transactions" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-4 animate-fade-in">
+          <h3 className="text-lg font-bold text-gray-900">
+            Smart Contract Verified Event Ledger
+          </h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-gray-100 font-bold text-gray-400 uppercase">
+                  <th className="pb-3">Event Type</th>
+                  <th className="pb-3">Campaign</th>
+                  <th className="pb-3">From / By</th>
+                  <th className="pb-3">Amount</th>
+                  <th className="pb-3 text-right">Tx Hash</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 font-mono">
+                {contractEvents.map((e, idx) => (
+                  <tr key={idx} className="hover:bg-gray-50/50">
+                    <td className="py-2.5">
+                      <span className="px-2 py-0.5 rounded font-bold font-sans text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-100">
+                        {e.type}
+                      </span>
+                    </td>
+                    <td className="py-2.5 font-sans font-bold text-gray-900">
+                      {e.campaignId ? `#${e.campaignId}` : "Protocol"}
+                    </td>
+                    <td className="py-2.5 text-gray-600">{shortenAddress(e.from || e.to)}</td>
+                    <td className="py-2.5 font-extrabold text-emerald-700">{e.amount ? `${e.amount} ETH` : "-"}</td>
+                    <td className="py-2.5 text-right text-gray-500">
+                      {explorerUrl ? (
+                        <a
+                          href={`${explorerUrl}/tx/${e.txHash}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-emerald-700 hover:underline"
+                        >
+                          {shortenAddress(e.txHash)}
+                        </a>
+                      ) : (
+                        <span>{shortenAddress(e.txHash)}</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== TAB 6: AI FRAUD DETECTION ==================== */}
+      {activeTab === "ai" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-6 animate-fade-in">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+              <Bot className="w-5 h-5 text-emerald-600" />
+              <span>AI Campaign Fraud Detection & NLP Risk Inspector</span>
+            </h3>
+            <p className="text-xs text-gray-500">
+              Natural Language Processing, TF-IDF cosine duplicate analysis, and outlier detection identify high-risk fundraising patterns for human review.
+            </p>
+          </div>
+
+          <div className="space-y-4">
+            {aiEvaluatedCampaigns.map((c) => (
+              <div
+                key={c.id}
+                className={`p-5 rounded-2xl border transition-all ${
+                  c.ai.riskLevel === "HIGH"
+                    ? "bg-rose-50/40 border-rose-200"
+                    : c.ai.riskLevel === "MEDIUM"
+                    ? "bg-amber-50/40 border-amber-200"
+                    : "bg-emerald-50/30 border-emerald-100"
+                }`}
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2">
+                  <div>
+                    <h4 className="font-extrabold text-sm text-gray-900">
+                      #{c.id} · {c.title}
+                    </h4>
+                    <span className="text-[11px] text-gray-500 font-mono">
+                      Creator: {shortenAddress(c.creator)} ({getAccountName(c.creator)}) · Goal: {c.goal} ETH
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`text-[10px] font-black px-2.5 py-1 rounded-full uppercase tracking-wider ${
+                        c.ai.riskLevel === "HIGH"
+                          ? "bg-rose-200 text-rose-900"
+                          : c.ai.riskLevel === "MEDIUM"
+                          ? "bg-amber-200 text-amber-900"
+                          : "bg-emerald-200 text-emerald-900"
+                      }`}
+                    >
+                      Risk Score: {c.ai.riskScore}/100 ({c.ai.riskLevel} RISK)
+                    </span>
+                    <span className="text-[10px] font-bold bg-white px-2 py-1 rounded-md border border-gray-200 text-gray-700">
+                      Status: {c.reviewStatus}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 text-xs text-gray-700 mb-3 bg-white/70 p-3 rounded-xl border border-gray-100">
+                  <span className="font-bold text-gray-900 block text-[11px]">Explainable Warning Indicators:</span>
+                  <ul className="list-disc list-inside space-y-0.5 text-[11px]">
+                    {c.ai.reasons.map((r, i) => (
+                      <li key={i}>{r}</li>
+                    ))}
+                  </ul>
+                </div>
+
+                {/* Moderation Actions */}
+                <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-gray-200/60 text-xs">
+                  <button
+                    onClick={() => handleModerateCampaign(c.id, "Verified by Admin")}
+                    className="px-3 py-1 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded-lg cursor-pointer"
+                  >
+                    Mark Verified / Reviewed
+                  </button>
+                  <button
+                    onClick={() => handleModerateCampaign(c.id, "Under Audit Investigation")}
+                    className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg cursor-pointer"
+                  >
+                    Flag for Investigation
+                  </button>
+                  <button
+                    onClick={() => handleModerateCampaign(c.id, "Requested Additional Evidence")}
+                    className="px-3 py-1 bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold rounded-lg cursor-pointer"
+                  >
+                    Request Additional Proof
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ==================== TAB 7: DISPUTES ==================== */}
+      {activeTab === "disputes" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-5 animate-fade-in">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+              <Scale className="w-5 h-5 text-emerald-600" />
+              <span>Smart Contract Dispute Arbitration</span>
+            </h3>
+            <p className="text-xs text-gray-500">
+              When a dispute is raised, milestone escrow disbursements are paused by contract rules until the protocol administrator delivers a verdict.
+            </p>
+          </div>
+
+          {allDisputes.length > 0 ? (
+            <div className="space-y-4">
+              {allDisputes.map((d) => (
+                <div key={d.id} className="p-5 rounded-2xl border border-gray-200 bg-gray-50/50 space-y-3 text-xs">
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <h4 className="font-bold text-sm text-gray-900">
+                        Dispute #{d.id} against Campaign #{d.campaignId} (Milestone #{d.milestoneIndex + 1})
+                      </h4>
+                      <span className="text-gray-500 font-mono text-[11px]">
+                        Complainant: {shortenAddress(d.complainant)} ({getAccountName(d.complainant)})
+                      </span>
+                    </div>
+                    <span
+                      className={`px-2.5 py-1 rounded-full font-bold text-[10px] uppercase ${
+                        d.resolved
+                          ? d.inFavorOfDonors
+                            ? "bg-rose-100 text-rose-900"
+                            : "bg-emerald-100 text-emerald-900"
+                          : "bg-amber-100 text-amber-900"
+                      }`}
+                    >
+                      {d.resolved ? (d.inFavorOfDonors ? "Upheld (In Favor of Donors)" : "Dismissed (In Favor of Creator)") : "Active Investigation"}
+                    </span>
+                  </div>
+
+                  <p className="p-3 bg-white rounded-xl border border-gray-100 text-gray-700">
+                    <strong>Complaint:</strong> {d.reason}
+                  </p>
+
+                  {d.evidenceUrl && (
+                    <div className="p-2 bg-white rounded-lg border border-gray-200 font-mono text-[11px]">
+                      Evidence Link: <a href={d.evidenceUrl} target="_blank" rel="noreferrer" className="text-emerald-700 underline">{d.evidenceUrl}</a>
+                    </div>
+                  )}
+
+                  {!d.resolved && (
+                    <div className="pt-2 flex gap-2">
+                      <button
+                        onClick={() => handleAdminResolveDispute(d.id, true)}
+                        className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold cursor-pointer"
+                      >
+                        Resolve In Favor of Donors (Enable Refund)
+                      </button>
+                      <button
+                        onClick={() => handleAdminResolveDispute(d.id, false)}
+                        className="px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl font-bold cursor-pointer"
+                      >
+                        Dismiss & Resume Releases (In Favor of Creator)
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-8 text-center text-xs text-gray-500 bg-gray-50 rounded-2xl border border-dashed border-gray-200">
+              No active or historical disputes recorded across the platform.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ==================== TAB 8: VISUAL ANALYTICS ==================== */}
+      {activeTab === "analytics" && (
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-8 animate-fade-in">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+              <BarChart3 className="w-5 h-5 text-emerald-600" />
+              <span>Executive On-Chain Analytics & Charts</span>
+            </h3>
+            <p className="text-xs text-gray-500">
+              Verifiable data derived in real time from smart contract state and emitted blockchain logs.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Chart 1: Status Distribution */}
+            <div className="p-5 bg-gray-50 rounded-2xl border border-gray-200/80 space-y-4">
+              <h4 className="font-bold text-sm text-gray-900">1. Campaign Status Distribution</h4>
+              <div className="space-y-2 text-xs">
+                {Object.entries(statusCounts).map(([k, v]) => {
+                  const pct = Math.round((v / (campaigns.length || 1)) * 100);
+                  return (
+                    <div key={k}>
+                      <div className="flex justify-between font-medium mb-1">
+                        <span>{k}</span>
+                        <span className="font-bold text-gray-900">{v} ({pct}%)</span>
                       </div>
-                      <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
-                        <div
-                          style={{ width: `${pct}%` }}
-                          className={`h-full ${s.color} transition-all duration-500`}
-                        />
+                      <div className="w-full bg-gray-200 h-2 rounded-full overflow-hidden">
+                        <div className="bg-[#14532D] h-full" style={{ width: `${pct}%` }} />
                       </div>
                     </div>
                   );
                 })}
               </div>
             </div>
-          </div>
 
-          {/* Quick Action: Pending Escrow Releases */}
-          {campaigns.filter((c) => c.canReleaseFunds).length > 0 && (
-            <div className="bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 p-6 rounded-3xl space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-emerald-600" />
-                  <h3 className="font-extrabold text-emerald-950 text-base">
-                    Campaigns Eligible for Escrow Fund Release
-                  </h3>
+            {/* Chart 2: ETH Locked vs Released vs Refunded */}
+            <div className="p-5 bg-gray-50 rounded-2xl border border-gray-200/80 space-y-4">
+              <h4 className="font-bold text-sm text-gray-900">2. Capital Settlement Breakdown</h4>
+              <div className="space-y-3 text-xs">
+                <div>
+                  <div className="flex justify-between font-medium mb-1">
+                    <span className="text-emerald-700 font-bold">Locked in Escrow</span>
+                    <span className="font-bold">{totalEscrowLocked} ETH ({escrowPct}%)</span>
+                  </div>
+                  <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-emerald-600 h-full transition-all" style={{ width: `${escrowPct}%` }} />
+                  </div>
                 </div>
-                <span className="text-xs bg-emerald-600 text-white font-bold px-2 py-0.5 rounded-full">
-                  Action Required
+
+                <div>
+                  <div className="flex justify-between font-medium mb-1">
+                    <span className="text-teal-700 font-bold">Released to Beneficiaries</span>
+                    <span className="font-bold">{totalReleased} ETH ({releasedPct}%)</span>
+                  </div>
+                  <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-teal-600 h-full transition-all" style={{ width: `${releasedPct}%` }} />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between font-medium mb-1">
+                    <span className="text-amber-700 font-bold">Refunded to Donors</span>
+                    <span className="font-bold">{totalRefunded} ETH ({refundedPct}%)</span>
+                  </div>
+                  <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-amber-500 h-full transition-all" style={{ width: `${refundedPct}%` }} />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Chart 3: Category Distribution */}
+            <div className="p-5 bg-gray-50 rounded-2xl border border-gray-200/80 space-y-4">
+              <h4 className="font-bold text-sm text-gray-900">3. Campaign Category Distribution</h4>
+              <div className="space-y-2 text-xs">
+                {Object.entries(categoryCounts).map(([cat, count]) => {
+                  const pct = Math.round((count / (campaigns.length || 1)) * 100);
+                  return (
+                    <div key={cat}>
+                      <div className="flex justify-between font-medium mb-1">
+                        <span>{cat}</span>
+                        <span className="font-bold text-gray-900">{count} campaigns ({pct}%)</span>
+                      </div>
+                      <div className="w-full bg-gray-200 h-2 rounded-full overflow-hidden">
+                        <div className="bg-emerald-700 h-full" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Chart 4: AI Risk Score Distribution */}
+            <div className="p-5 bg-gray-50 rounded-2xl border border-gray-200/80 space-y-4">
+              <h4 className="font-bold text-sm text-gray-900">4. AI Fraud Risk Score Bands</h4>
+              <div className="space-y-3 text-xs">
+                <div>
+                  <div className="flex justify-between font-medium mb-1">
+                    <span className="text-emerald-700 font-bold">Low Risk (&lt; 35 Score)</span>
+                    <span className="font-bold text-gray-900">{aiRiskCounts.LOW} campaigns</span>
+                  </div>
+                  <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-emerald-600 h-full" style={{ width: `${(aiRiskCounts.LOW / (campaigns.length || 1)) * 100}%` }} />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between font-medium mb-1">
+                    <span className="text-amber-700 font-bold">Medium Risk (35-70 Score)</span>
+                    <span className="font-bold text-gray-900">{aiRiskCounts.MEDIUM} campaigns</span>
+                  </div>
+                  <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-amber-500 h-full" style={{ width: `${(aiRiskCounts.MEDIUM / (campaigns.length || 1)) * 100}%` }} />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between font-medium mb-1">
+                    <span className="text-rose-700 font-bold">High Risk (&gt; 70 Score)</span>
+                    <span className="font-bold text-gray-900">{aiRiskCounts.HIGH} campaigns</span>
+                  </div>
+                  <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-rose-600 h-full" style={{ width: `${(aiRiskCounts.HIGH / (campaigns.length || 1)) * 100}%` }} />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Chart 5: On-Chain Contributions Over Time */}
+            <div className="lg:col-span-2 p-5 bg-gray-50 rounded-2xl border border-gray-200/80 space-y-4">
+              <div className="flex items-center justify-between">
+                <h4 className="font-bold text-sm text-gray-900">5. On-Chain Contributions Timeline</h4>
+                <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
+                  {contributionTimeline.length} recent verified event(s)
                 </span>
               </div>
-              <p className="text-xs text-emerald-800">
-                The deadline has passed and the funding goal was reached for the campaigns below. Anyone can trigger the permissionless smart contract release to send ETH directly to the beneficiary:
-              </p>
-              <div className="space-y-2 pt-2">
-                {campaigns
-                  .filter((c) => c.canReleaseFunds)
-                  .map((c) => (
-                    <div
-                      key={c.id}
-                      className="bg-white p-4 rounded-2xl border border-emerald-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs"
-                    >
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-gray-900 text-sm">#{c.id} {c.title}</span>
-                          <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded font-semibold">
-                            {c.category}
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-500 mt-0.5 font-mono">
-                          Beneficiary: {shortenAddress(c.beneficiary)} &bull; Escrow Amount: {c.escrowBalance} ETH
-                        </p>
-                      </div>
-                      <button
-                        onClick={() => handleReleaseEscrow(c.id)}
-                        disabled={txState.loading}
-                        className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold text-xs rounded-xl shadow-sm hover:scale-[1.02] active:scale-[0.98] transition-all cursor-pointer flex items-center justify-center gap-1.5 shrink-0"
-                      >
-                        <Unlock className="w-3.5 h-3.5" />
-                        <span>Release {c.escrowBalance} ETH</span>
-                      </button>
+              {contributionTimeline.length > 0 ? (
+                <div className="flex items-end gap-3 h-40 pt-4 px-2 bg-white rounded-xl border border-gray-100">
+                  {contributionTimeline.map((item) => (
+                    <div key={item.id} className="flex-1 flex flex-col items-center justify-end h-full gap-1.5 group">
+                      <span className="text-[10px] font-bold text-emerald-800 opacity-90">
+                        {item.amount} ETH
+                      </span>
+                      <div
+                        className="w-full max-w-[44px] bg-gradient-to-t from-[#14532D] to-[#16A34A] rounded-t-lg transition-all group-hover:opacity-90"
+                        style={{ height: `${item.pct}%` }}
+                        title={`${item.label} (${item.amount} ETH at ${item.date})`}
+                      />
+                      <span className="text-[10px] text-gray-500 font-mono truncate max-w-full pb-1">
+                        #{item.campaignId}
+                      </span>
                     </div>
                   ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* TAB 2: CAMPAIGN MANAGEMENT */}
-      {activeTab === "campaigns" && (
-        <div className="space-y-6 animate-fade-in">
-          {/* Controls */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-gray-100">
-            <div className="relative flex-1">
-              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input
-                type="text"
-                value={campaignSearch}
-                onChange={(e) => setCampaignSearch(e.target.value)}
-                placeholder="Search by title, creator, beneficiary, category..."
-                className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs focus:outline-none focus:border-emerald-500"
-              />
-            </div>
-            <div className="flex items-center gap-2">
-              <Filter className="w-4 h-4 text-gray-400" />
-              <select
-                value={campaignStatusFilter}
-                onChange={(e) => setCampaignStatusFilter(e.target.value)}
-                className="bg-gray-50 border border-gray-200 text-xs rounded-xl px-3 py-2 font-medium focus:outline-none focus:border-emerald-500"
-              >
-                <option value="all">All Statuses</option>
-                <option value="active">Active</option>
-                <option value="goal achieved">Goal Achieved</option>
-                <option value="awaiting">Awaiting Release</option>
-                <option value="funds released">Funds Released</option>
-                <option value="refund available">Refund Available</option>
-                <option value="refunded">Refunded</option>
-              </select>
-            </div>
-          </div>
-
-          {/* Table */}
-          <div className="bg-white rounded-3xl border border-gray-100 overflow-hidden shadow-sm">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="bg-gray-50 text-gray-500 font-bold uppercase tracking-wider border-b border-gray-100">
-                    <th className="py-3.5 px-4">ID</th>
-                    <th className="py-3.5 px-4">Title & Category</th>
-                    <th className="py-3.5 px-4">Creator / Beneficiary</th>
-                    <th className="py-3.5 px-4">Goal / Raised</th>
-                    <th className="py-3.5 px-4">Escrow Balance</th>
-                    <th className="py-3.5 px-4">Deadline</th>
-                    <th className="py-3.5 px-4">Status</th>
-                    <th className="py-3.5 px-4 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {filteredCampaigns.map((c) => (
-                    <tr key={c.id} className="hover:bg-gray-50/60 transition-colors">
-                      <td className="py-3.5 px-4 font-mono font-bold text-gray-900">#{c.id}</td>
-                      <td className="py-3.5 px-4 max-w-xs">
-                        <Link
-                          to={`/campaign/${c.id}`}
-                          className="font-bold text-gray-900 hover:text-emerald-700 block truncate"
-                        >
-                          {c.title}
-                        </Link>
-                        <span className="text-[10px] text-gray-500 font-medium">{c.category}</span>
-                      </td>
-                      <td className="py-3.5 px-4 font-mono text-[11px] text-gray-600">
-                        <div>
-                          <span className="text-gray-400">Creator: </span>
-                          <span title={c.creator}>{shortenAddress(c.creator)}</span>
-                        </div>
-                        <div>
-                          <span className="text-gray-400">Ben: </span>
-                          <span className="font-semibold text-gray-800" title={c.beneficiary}>
-                            {shortenAddress(c.beneficiary)}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="py-3.5 px-4 font-mono">
-                        <span className="font-bold text-gray-900">{c.amountRaised} ETH</span>
-                        <span className="text-gray-400 text-[10px] block">Goal: {c.goal} ETH</span>
-                      </td>
-                      <td className="py-3.5 px-4 font-mono font-bold text-emerald-800">
-                        {c.escrowBalance} ETH
-                      </td>
-                      <td className="py-3.5 px-4 text-gray-600 text-[11px]">
-                        <div>{new Date(c.deadline * 1000).toLocaleDateString()}</div>
-                        <div className={`text-[10px] font-semibold ${c.isExpired ? "text-rose-600" : "text-emerald-600"}`}>
-                          {c.isExpired ? "Expired" : "Active"}
-                        </div>
-                      </td>
-                      <td className="py-3.5 px-4">
-                        <span
-                          className={`inline-block px-2.5 py-1 rounded-full text-[10px] font-bold ${
-                            c.status === "Funds Released"
-                              ? "bg-teal-100 text-teal-800"
-                              : c.status === "Awaiting Release"
-                              ? "bg-indigo-100 text-indigo-800 animate-pulse"
-                              : c.status === "Goal Achieved"
-                              ? "bg-emerald-100 text-emerald-800"
-                              : c.status === "Refund Available"
-                              ? "bg-amber-100 text-amber-800"
-                              : c.status === "Refunded"
-                              ? "bg-gray-100 text-gray-700"
-                              : "bg-blue-100 text-blue-800"
-                          }`}
-                        >
-                          {c.status}
-                        </span>
-                      </td>
-                      <td className="py-3.5 px-4 text-right">
-                        <div className="flex items-center justify-end gap-1.5">
-                          {c.canReleaseFunds && (
-                            <button
-                              onClick={() => handleReleaseEscrow(c.id)}
-                              disabled={txState.loading}
-                              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg text-[10px] shadow-xs cursor-pointer"
-                            >
-                              Release
-                            </button>
-                          )}
-                          <Link
-                            to={`/campaign/${c.id}`}
-                            className="p-1.5 hover:bg-gray-100 rounded-lg text-gray-500 hover:text-gray-900"
-                            title="View campaign page"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </Link>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredCampaigns.length === 0 && (
-                    <tr>
-                      <td colSpan={8} className="py-8 text-center text-gray-400 text-xs">
-                        No campaigns found matching criteria.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
+                </div>
+              ) : (
+                <div className="p-6 text-center text-xs text-gray-500 bg-white rounded-xl border border-dashed border-gray-200">
+                  No on-chain contribution events recorded yet.
+                </div>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {/* TAB 3: ESCROW MONITORING */}
-      {activeTab === "escrow" && (
-        <div className="space-y-6 animate-fade-in">
-          {/* Escrow Architecture Card */}
-          <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm space-y-4">
-            <div className="flex items-center gap-3">
-              <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-700 flex items-center justify-center">
-                <Lock className="w-6 h-6 stroke-[2.2]" />
-              </div>
-              <div>
-                <h3 className="font-extrabold text-gray-900 text-base">
-                  Smart Contract Escrow Architecture
-                </h3>
-                <p className="text-xs text-gray-500">
-                  Trustless custodial vault operating autonomously on Ethereum
-                </p>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-              <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 space-y-1">
-                <span className="text-gray-500 text-xs font-medium">Smart Contract Vault Address</span>
-                <p className="font-mono text-xs font-bold text-gray-900 break-all">{CONTRACT_ADDRESS}</p>
-                <span className="text-[10px] text-emerald-700 font-semibold block pt-1">
-                  &bull; Verified Solidity Escrow
-                </span>
-              </div>
-
-              <div className="bg-emerald-50/60 p-4 rounded-2xl border border-emerald-100 space-y-1">
-                <span className="text-emerald-800 text-xs font-medium">Total ETH in Active Escrow</span>
-                <p className="font-extrabold text-2xl text-emerald-950">{totalEscrowLocked} ETH</p>
-                <span className="text-[10px] text-emerald-700 block">
-                  Across {campaigns.filter((c) => parseFloat(c.escrowBalance) > 0).length} active campaigns
-                </span>
-              </div>
-
-              <div className="bg-teal-50/60 p-4 rounded-2xl border border-teal-100 space-y-1">
-                <span className="text-teal-800 text-xs font-medium">Historical Released to Beneficiaries</span>
-                <p className="font-extrabold text-2xl text-teal-950">{totalReleased} ETH</p>
-                <span className="text-[10px] text-teal-700 block">
-                  Successfully disbursed upon target completion
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Escrow Campaigns Breakdown */}
-          <div className="bg-white rounded-3xl border border-gray-100 p-6 shadow-sm space-y-4">
-            <h3 className="font-extrabold text-base text-gray-900">
-              Campaign Escrow Ledger
-            </h3>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="bg-gray-50 text-gray-500 font-bold uppercase tracking-wider border-b border-gray-100">
-                    <th className="py-3 px-4">Campaign</th>
-                    <th className="py-3 px-4">Target Goal</th>
-                    <th className="py-3 px-4">Raised Amount</th>
-                    <th className="py-3 px-4">Current Escrow Balance</th>
-                    <th className="py-3 px-4">Beneficiary</th>
-                    <th className="py-3 px-4">Escrow Status</th>
-                    <th className="py-3 px-4 text-right">Settlement</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 font-mono">
-                  {campaigns.map((c) => (
-                    <tr key={c.id} className="hover:bg-gray-50/60">
-                      <td className="py-3 px-4 font-sans font-bold text-gray-900">
-                        #{c.id} {c.title}
-                      </td>
-                      <td className="py-3 px-4 text-gray-600">{c.goal} ETH</td>
-                      <td className="py-3 px-4 font-semibold text-gray-900">{c.amountRaised} ETH</td>
-                      <td className="py-3 px-4 font-bold text-emerald-800">{c.escrowBalance} ETH</td>
-                      <td className="py-3 px-4 text-gray-700" title={c.beneficiary}>
-                        {shortenAddress(c.beneficiary)}
-                      </td>
-                      <td className="py-3 px-4 font-sans">
-                        <span
-                          className={`inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                            c.status === "Funds Released"
-                              ? "bg-teal-100 text-teal-800"
-                              : c.status === "Awaiting Release"
-                              ? "bg-indigo-100 text-indigo-800"
-                              : c.status === "Refund Available"
-                              ? "bg-amber-100 text-amber-800"
-                              : "bg-emerald-100 text-emerald-800"
-                          }`}
-                        >
-                          {c.statusBadge}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-right font-sans">
-                        {c.canReleaseFunds ? (
-                          <button
-                            onClick={() => handleReleaseEscrow(c.id)}
-                            className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px] rounded-lg"
-                          >
-                            Release Funds
-                          </button>
-                        ) : c.status === "Funds Released" ? (
-                          <span className="text-[11px] text-teal-700 font-semibold flex items-center justify-end gap-1">
-                            <CheckCircle2 className="w-3.5 h-3.5" /> Disbursed
-                          </span>
-                        ) : (
-                          <span className="text-gray-400 text-[11px]">Locked</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 4: USER / WALLET MANAGEMENT */}
-      {activeTab === "users" && (
-        <div className="space-y-6 animate-fade-in">
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-gray-100">
-            <div className="relative flex-1">
-              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input
-                type="text"
-                value={userSearch}
-                onChange={(e) => setUserSearch(e.target.value)}
-                placeholder="Search wallet address..."
-                className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs focus:outline-none focus:border-emerald-500 font-mono"
-              />
-            </div>
-            <span className="text-xs text-gray-500 font-medium px-2">
-              Showing {filteredUsers.length} active wallets
-            </span>
-          </div>
-
-          <div className="bg-white rounded-3xl border border-gray-100 overflow-hidden shadow-sm">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="bg-gray-50 text-gray-500 font-bold uppercase tracking-wider border-b border-gray-100">
-                    <th className="py-3.5 px-4">Wallet Address</th>
-                    <th className="py-3.5 px-4">Role</th>
-                    <th className="py-3.5 px-4">Total Contributed</th>
-                    <th className="py-3.5 px-4">Contributions</th>
-                    <th className="py-3.5 px-4">Campaigns Created</th>
-                    <th className="py-3.5 px-4">Received as Beneficiary</th>
-                    <th className="py-3.5 px-4 text-right">Copy</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 font-mono">
-                  {filteredUsers.map((u) => {
-                    const isCurrentAdmin =
-                      u.address.toLowerCase() === adminAddress.toLowerCase();
-                    return (
-                      <tr key={u.address} className="hover:bg-gray-50/60 transition-colors">
-                        <td className="py-3.5 px-4">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-gray-900 break-all">{u.address}</span>
-                          </div>
-                        </td>
-                        <td className="py-3.5 px-4 font-sans">
-                          <div className="flex flex-wrap gap-1">
-                            {isCurrentAdmin && (
-                              <span className="bg-purple-100 text-purple-800 px-2 py-0.5 rounded text-[10px] font-bold">
-                                Admin
-                              </span>
-                            )}
-                            {u.isCreator && (
-                              <span className="bg-blue-100 text-blue-800 px-2 py-0.5 rounded text-[10px] font-bold">
-                                Creator
-                              </span>
-                            )}
-                            {u.isContributor && (
-                              <span className="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded text-[10px] font-bold">
-                                Contributor
-                              </span>
-                            )}
-                            {u.isBeneficiary && (
-                              <span className="bg-teal-100 text-teal-800 px-2 py-0.5 rounded text-[10px] font-bold">
-                                Beneficiary
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="py-3.5 px-4 font-bold text-gray-900">
-                          {u.totalContributed.toFixed(4)} ETH
-                        </td>
-                        <td className="py-3.5 px-4 text-gray-600">{u.contributionsCount}</td>
-                        <td className="py-3.5 px-4 text-gray-600">{u.campaignsCreated}</td>
-                        <td className="py-3.5 px-4 font-bold text-teal-800">
-                          {u.totalReceivedAsBeneficiary.toFixed(4)} ETH
-                        </td>
-                        <td className="py-3.5 px-4 text-right">
-                          <button
-                            onClick={() => handleCopy(u.address)}
-                            className="p-1.5 hover:bg-gray-100 rounded-lg text-gray-500 hover:text-gray-900 transition-colors"
-                            title="Copy full address"
-                          >
-                            {copiedAddress === u.address ? (
-                              <Check className="w-3.5 h-3.5 text-emerald-600" />
-                            ) : (
-                              <Copy className="w-3.5 h-3.5" />
-                            )}
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {filteredUsers.length === 0 && (
-                    <tr>
-                      <td colSpan={7} className="py-8 text-center text-gray-400 text-xs">
-                        No user addresses found matching search.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 5: TRANSACTION MONITORING */}
-      {activeTab === "transactions" && (
-        <div className="space-y-6 animate-fade-in">
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-gray-100">
-            <div className="flex items-center gap-2">
-              <Filter className="w-4 h-4 text-gray-400" />
-              <select
-                value={txTypeFilter}
-                onChange={(e) => setTxTypeFilter(e.target.value)}
-                className="bg-gray-50 border border-gray-200 text-xs rounded-xl px-3 py-2 font-medium focus:outline-none focus:border-emerald-500"
-              >
-                <option value="all">All Transaction Types</option>
-                <option value="campaigncreated">Campaign Creation</option>
-                <option value="contributionreceived">Escrow Contribution</option>
-                <option value="fundsreleased">Escrow Fund Release</option>
-                <option value="refundclaimed">Escrow Refund</option>
-                <option value="contributionwithdrawn">Early Withdrawal</option>
-                <option value="userdeposited">Vault Deposit</option>
-              </select>
-            </div>
-            <span className="text-xs text-gray-500 font-medium">
-              Showing {filteredEvents.length} recorded events
-            </span>
-          </div>
-
-          <div className="bg-white rounded-3xl border border-gray-100 overflow-hidden shadow-sm">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="bg-gray-50 text-gray-500 font-bold uppercase tracking-wider border-b border-gray-100">
-                    <th className="py-3.5 px-4">Tx Hash</th>
-                    <th className="py-3.5 px-4">Event Type</th>
-                    <th className="py-3.5 px-4">From</th>
-                    <th className="py-3.5 px-4">To</th>
-                    <th className="py-3.5 px-4">Amount</th>
-                    <th className="py-3.5 px-4">Time</th>
-                    <th className="py-3.5 px-4">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 font-mono">
-                  {filteredEvents.map((e, idx) => (
-                    <tr key={`${e.txHash}-${idx}`} className="hover:bg-gray-50/60 transition-colors">
-                      <td className="py-3.5 px-4 font-bold text-gray-900">
-                        <span title={e.txHash}>{shortenAddress(e.txHash)}</span>
-                      </td>
-                      <td className="py-3.5 px-4 font-sans">
-                        <span
-                          className={`inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                            e.type === "ContributionReceived"
-                              ? "bg-emerald-100 text-emerald-800"
-                              : e.type === "FundsReleased"
-                              ? "bg-teal-100 text-teal-800"
-                              : e.type === "RefundClaimed"
-                              ? "bg-amber-100 text-amber-800"
-                              : e.type === "CampaignCreated"
-                              ? "bg-blue-100 text-blue-800"
-                              : "bg-gray-100 text-gray-700"
-                          }`}
-                        >
-                          {e.type}
-                        </span>
-                      </td>
-                      <td className="py-3.5 px-4 text-gray-600" title={e.from || e.address}>
-                        {shortenAddress(e.from || e.address)}
-                      </td>
-                      <td className="py-3.5 px-4 text-gray-600" title={e.to || CONTRACT_ADDRESS}>
-                        {shortenAddress(e.to || CONTRACT_ADDRESS)}
-                      </td>
-                      <td className="py-3.5 px-4 font-bold text-gray-900">
-                        {e.amount ? `${e.amount} ETH` : "-"}
-                      </td>
-                      <td className="py-3.5 px-4 font-sans text-gray-500 text-[11px]">
-                        {new Date(e.timestamp).toLocaleString()}
-                      </td>
-                      <td className="py-3.5 px-4 font-sans">
-                        <span className="text-emerald-700 font-semibold text-[11px] flex items-center gap-1">
-                          <CheckCircle2 className="w-3.5 h-3.5" /> Confirmed
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredEvents.length === 0 && (
-                    <tr>
-                      <td colSpan={7} className="py-8 text-center text-gray-400 text-xs font-sans">
-                        No transactions found for the selected filter.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 6: SETTINGS & DEV TOOLS */}
+      {/* ==================== TAB 9: SETTINGS & DEV TOOLS ==================== */}
       {activeTab === "settings" && (
-        <div className="space-y-6 animate-fade-in max-w-4xl">
-          {/* Protocol Configuration Info */}
-          <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm space-y-4">
-            <h3 className="font-extrabold text-base text-gray-900">
-              Protocol Configuration
+        <div className="bg-white rounded-3xl border border-gray-200/80 p-6 shadow-soft space-y-6 animate-fade-in">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">
+              Smart Contract Settings & EVM Simulator
             </h3>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs font-mono">
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-100">
-                <span className="text-gray-400 font-sans block mb-1">Contract Address</span>
-                <span className="text-gray-900 font-bold break-all">{CONTRACT_ADDRESS}</span>
-              </div>
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-100">
-                <span className="text-gray-400 font-sans block mb-1">Admin Address</span>
-                <span className="text-gray-900 font-bold break-all">{adminAddress}</span>
-              </div>
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-100">
-                <span className="text-gray-400 font-sans block mb-1">Network Chain ID</span>
-                <span className="text-gray-900 font-bold">{CHAIN_ID}</span>
-              </div>
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-100">
-                <span className="text-gray-400 font-sans block mb-1">EVM Environment</span>
-                <span className="text-gray-900 font-bold">
-                  {SUPPORTED_NETWORKS[CHAIN_ID]?.name || "Localhost (31337)"}
-                </span>
-              </div>
+            <p className="text-xs text-gray-500">
+              Technical on-chain addresses and local development tools for testing deadlines.
+            </p>
+          </div>
+
+          <div className="bg-gray-50 p-4 rounded-2xl border border-gray-200 font-mono text-xs space-y-3">
+            <div>
+              <span className="text-gray-400 block uppercase tracking-wider text-[10px]">Smart Contract Address:</span>
+              <span className="font-bold text-gray-900 break-all">{CONTRACT_ADDRESS}</span>
+            </div>
+            <div>
+              <span className="text-gray-400 block uppercase tracking-wider text-[10px]">Protocol Admin Wallet:</span>
+              <span className="font-bold text-emerald-800 break-all">{adminAddress}</span>
+            </div>
+            <div>
+              <span className="text-gray-400 block uppercase tracking-wider text-[10px]">Network Target:</span>
+              <span className="font-bold text-gray-900">{network?.name || `Chain ID ${chainId}`}</span>
             </div>
           </div>
 
-          {/* Local Blockchain Fast-Forward / Time Machine */}
-          <div className="bg-gradient-to-br from-amber-50 to-orange-50 p-6 rounded-3xl border border-amber-200/80 shadow-sm space-y-4">
-            <div className="flex items-center gap-2.5">
-              <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center">
-                <FastForward className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="font-extrabold text-amber-950 text-base">
-                  Local Blockchain Fast-Forward (Time Machine)
-                </h3>
-                <p className="text-xs text-amber-800">
-                  Simulate passing campaign deadlines instantly on local Hardhat / Remix nodes
-                </p>
-              </div>
-            </div>
-
-            <p className="text-xs text-amber-900 leading-relaxed">
-              In production, campaign deadlines expire naturally with block timestamps. In local testing, you can use these controls to advance EVM block time (via <code>evm_increaseTime</code> and <code>evm_mine</code>) to test campaign deadline expiration, fund release conditions, and contributor refunds live in front of reviewers or examiners:
+          <div className="p-5 bg-emerald-50/60 rounded-2xl border border-emerald-200/80 space-y-3">
+            <h4 className="font-bold text-sm text-emerald-950 flex items-center gap-1.5">
+              <FastForward className="w-4 h-4 text-emerald-700" />
+              <span>Local EVM Time Fast-Forward Tool</span>
+            </h4>
+            <p className="text-xs text-gray-600">
+              Advances the block timestamp on the local node via <code className="bg-white px-1.5 py-0.5 rounded font-mono">evm_increaseTime</code> so you can instantly demonstrate campaign deadlines passing.
             </p>
-
-            {fastForwardSuccess && (
-              <div className="p-3 bg-emerald-100 text-emerald-900 rounded-xl text-xs font-semibold flex items-center gap-2">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span>{fastForwardSuccess}</span>
-              </div>
-            )}
-
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+            <div className="flex flex-wrap gap-2 pt-2">
               {[
-                { days: 1, label: "+1 Day" },
-                { days: 7, label: "+7 Days" },
-                { days: 14, label: "+14 Days" },
-                { days: 30, label: "+30 Days" },
+                { label: "+1 Hour", days: 1 / 24 },
+                { label: "+1 Day", days: 1 },
+                { label: "+7 Days", days: 7 },
+                { label: "+14 Days", days: 14 },
+                { label: "+30 Days", days: 30 },
               ].map((btn) => (
                 <button
-                  key={btn.days}
+                  key={btn.label}
                   onClick={() => handleFastForward(btn.days)}
-                  disabled={fastForwardLoading}
-                  className="py-3 px-4 bg-white hover:bg-amber-100/70 border border-amber-300 rounded-2xl text-xs font-bold text-amber-900 shadow-xs hover:shadow-sm active:scale-[0.98] transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  disabled={fastForwardLoading || !isLocalDevNetwork}
+                  className="px-3.5 py-2 bg-white border border-gray-300 hover:border-emerald-600 disabled:opacity-50 text-gray-800 rounded-xl text-xs font-bold shadow-xs hover:bg-emerald-50 transition-all cursor-pointer"
                 >
-                  <Clock className="w-3.5 h-3.5 text-amber-700" />
-                  <span>{fastForwardLoading ? "Mining..." : btn.label}</span>
+                  {btn.label}
                 </button>
               ))}
             </div>
           </div>
         </div>
       )}
+
+      {/* Campaign Expiry & Escrow Release Demo Modal */}
+      <ExpiryReleaseDemoModal
+        isOpen={demoModalOpen}
+        onClose={() => setDemoModalOpen(false)}
+        onCompleted={loadAdminData}
+      />
     </div>
   );
 }

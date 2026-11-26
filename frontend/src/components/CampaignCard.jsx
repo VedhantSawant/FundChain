@@ -64,7 +64,7 @@ export default function CampaignCard({ campaign }) {
   const displayImage = imageUrl && imageUrl.trim().length > 0 ? imageUrl : catMeta.defaultImg;
 
   // Format remaining time
-  const now = Math.floor(Date.now() / 1000);
+  const now = campaign.chainTimestamp || Math.floor(Date.now() / 1000);
   const secondsLeft = deadline - now;
   let remainingText = "Expired";
   if (secondsLeft > 0) {

@@ -25,14 +25,37 @@ import {
   getCampaignContributions,
   getReadOnlyProvider,
   getBrowserProvider,
+  getCampaignMilestones,
+  submitMilestoneEvidenceOnChain,
+  approveMilestoneOnChain,
+  rejectMilestoneOnChain,
+  releaseMilestoneFundsOnChain,
+  createProposalOnChain,
+  voteOnProposalOnChain,
+  executeProposalOnChain,
+  getCampaignProposals,
+  raiseDisputeOnChain,
+  resolveDisputeOnChain,
+  getCampaignDisputes,
+  getAllDisputes,
+  getCreatorReputation,
 } from "../blockchain/contract";
 import { CHAIN_ID, CONTRACT_ADDRESS, ADMIN_ADDRESS, SUPPORTED_NETWORKS } from "../blockchain/config";
+
+const DEFAULT_ACCOUNT_NAMES = {
+  "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266": "Admin Account",
+  "0x70997970c51812dc3a010c7d01b50e0d17dc79c8": "Campaign Creator / Beneficiary",
+  "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc": "Donor Account 1",
+  "0x90f79bf6eb2c4f870365e785982e1f101e93b906": "Donor Account 2",
+  "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65": "Beneficiary Account",
+};
 
 const Web3Context = createContext(null);
 
 export function Web3Provider({ children }) {
   const [account, setAccount] = useState("");
   const [availableAccounts, setAvailableAccounts] = useState([]);
+  const [accountBalances, setAccountBalances] = useState({});
   const [chainId, setChainId] = useState(null);
   const [balance, setBalance] = useState("0");
   const [vaultBalance, setVaultBalance] = useState("0");
@@ -42,6 +65,39 @@ export function Web3Provider({ children }) {
   const [contractAvailable, setContractAvailable] = useState(true);
   const [isAddMoneyOpen, setIsAddMoneyOpen] = useState(false);
   const [adminAddress, setAdminAddress] = useState(ADMIN_ADDRESS || "");
+
+  // Custom Account Naming state
+  const [customNames, setCustomNames] = useState(() => {
+    try {
+      const stored = localStorage.getItem("fundchain_account_names");
+      return stored ? JSON.parse(stored) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const getAccountName = useCallback((addr) => {
+    if (!addr) return "Wallet Account";
+    const lower = addr.toLowerCase();
+    if (customNames[lower]) return customNames[lower];
+    if (DEFAULT_ACCOUNT_NAMES[lower]) return DEFAULT_ACCOUNT_NAMES[lower];
+    return `Account ${addr.substring(0, 6)}...${addr.substring(addr.length - 4)}`;
+  }, [customNames]);
+
+  const setCustomAccountName = useCallback((addr, name) => {
+    if (!addr) return;
+    const lower = addr.toLowerCase();
+    const finalName = name.trim() || DEFAULT_ACCOUNT_NAMES[lower] || `Account ${addr.substring(0, 6)}`;
+    setCustomNames((prev) => {
+      const updated = { ...prev, [lower]: finalName };
+      try {
+        localStorage.setItem("fundchain_account_names", JSON.stringify(updated));
+      } catch (e) {
+        console.warn("Could not save account name:", e);
+      }
+      return updated;
+    });
+  }, []);
 
   const isAdmin = Boolean(
     account && adminAddress && account.toLowerCase() === adminAddress.toLowerCase()
@@ -75,7 +131,9 @@ export function Web3Provider({ children }) {
     if (!userAddress || !provider) return;
     try {
       const bal = await provider.getBalance(userAddress);
-      setBalance(parseFloat(ethers.formatEther(bal)).toFixed(4));
+      const formatted = parseFloat(ethers.formatEther(bal)).toFixed(4);
+      setBalance(formatted);
+      setAccountBalances((prev) => ({ ...prev, [userAddress.toLowerCase()]: formatted }));
       
       const vBal = await getUserVaultBalance(userAddress, provider);
       setVaultBalance(parseFloat(vBal).toFixed(4));
@@ -83,6 +141,36 @@ export function Web3Provider({ children }) {
       console.warn("Failed to update balance:", err);
     }
   }, []);
+
+  // Update balances for all authorized accounts
+  const updateAllBalances = useCallback(async (accountsList, provider) => {
+    if (!accountsList || accountsList.length === 0 || !provider) return;
+    const balances = {};
+    for (const acc of accountsList) {
+      try {
+        const bal = await provider.getBalance(acc);
+        balances[acc.toLowerCase()] = parseFloat(ethers.formatEther(bal)).toFixed(4);
+      } catch {
+        // ignore
+      }
+    }
+    setAccountBalances((prev) => ({ ...prev, ...balances }));
+  }, []);
+
+  // Periodic real-time balance sync (every 6 seconds)
+  useEffect(() => {
+    if (!account) return;
+    const interval = setInterval(async () => {
+      const browserProvider = getBrowserProvider();
+      if (browserProvider) {
+        await updateBalance(account, browserProvider);
+        if (availableAccounts.length > 0) {
+          await updateAllBalances(availableAccounts, browserProvider);
+        }
+      }
+    }, 6000);
+    return () => clearInterval(interval);
+  }, [account, availableAccounts, updateBalance, updateAllBalances]);
 
   // Connect wallet
   const connectWallet = useCallback(async () => {
@@ -306,6 +394,9 @@ export function Web3Provider({ children }) {
       await refreshCampaigns();
       const browserProvider = getBrowserProvider();
       if (account && browserProvider) await updateBalance(account, browserProvider);
+      if (availableAccounts.length > 0 && browserProvider) {
+        await updateAllBalances(availableAccounts, browserProvider);
+      }
       return result;
     } catch (err) {
       const msg = err.reason || err.data?.message || err.message || "Contribution transaction failed";
@@ -329,6 +420,9 @@ export function Web3Provider({ children }) {
       await refreshCampaigns();
       const browserProvider = getBrowserProvider();
       if (account && browserProvider) await updateBalance(account, browserProvider);
+      if (availableAccounts.length > 0 && browserProvider) {
+        await updateAllBalances(availableAccounts, browserProvider);
+      }
       return result;
     } catch (err) {
       const msg = err.reason || err.data?.message || err.message || "Contribution withdrawal failed";
@@ -352,6 +446,9 @@ export function Web3Provider({ children }) {
       await refreshCampaigns();
       const browserProvider = getBrowserProvider();
       if (account && browserProvider) await updateBalance(account, browserProvider);
+      if (availableAccounts.length > 0 && browserProvider) {
+        await updateAllBalances(availableAccounts, browserProvider);
+      }
       return result;
     } catch (err) {
       const msg = err.reason || err.data?.message || err.message || "Release transaction failed";
@@ -394,6 +491,9 @@ export function Web3Provider({ children }) {
       await refreshCampaigns();
       const browserProvider = getBrowserProvider();
       if (account && browserProvider) await updateBalance(account, browserProvider);
+      if (availableAccounts.length > 0 && browserProvider) {
+        await updateAllBalances(availableAccounts, browserProvider);
+      }
       return result;
     } catch (err) {
       const msg = err.reason || err.data?.message || err.message || "Refund claim failed";
@@ -467,6 +567,197 @@ export function Web3Provider({ children }) {
     }
   };
 
+  // Submit Milestone Evidence
+  const submitMilestoneEvidence = async (campaignId, milestoneIndex, evidenceUrl) => {
+    setTxState({ loading: true, hash: null, message: "Submitting milestone completion proof...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await submitMilestoneEvidenceOnChain(signer, campaignId, milestoneIndex, evidenceUrl);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Milestone evidence successfully submitted on-chain!",
+        error: null,
+      });
+      await refreshCampaigns();
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed to submit milestone evidence";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Approve Milestone (Admin)
+  const approveMilestone = async (campaignId, milestoneIndex) => {
+    setTxState({ loading: true, hash: null, message: "Approving milestone on blockchain...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await approveMilestoneOnChain(signer, campaignId, milestoneIndex);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Milestone successfully approved!",
+        error: null,
+      });
+      await refreshCampaigns();
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed to approve milestone";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Reject Milestone (Admin)
+  const rejectMilestone = async (campaignId, milestoneIndex, reason) => {
+    setTxState({ loading: true, hash: null, message: "Rejecting milestone...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await rejectMilestoneOnChain(signer, campaignId, milestoneIndex, reason);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Milestone rejected with feedback.",
+        error: null,
+      });
+      await refreshCampaigns();
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed to reject milestone";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Release Milestone Funds
+  const releaseMilestoneFunds = async (campaignId, milestoneIndex) => {
+    setTxState({ loading: true, hash: null, message: "Releasing approved milestone funds...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await releaseMilestoneFundsOnChain(signer, campaignId, milestoneIndex);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Milestone funds successfully disbursed to beneficiary!",
+        error: null,
+      });
+      await refreshCampaigns();
+      const browserProvider = getBrowserProvider();
+      if (account && browserProvider) await updateBalance(account, browserProvider);
+      if (availableAccounts.length > 0 && browserProvider) {
+        await updateAllBalances(availableAccounts, browserProvider);
+      }
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Milestone release failed";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Create Proposal
+  const createProposal = async (campaignId, title, description, durationSeconds) => {
+    setTxState({ loading: true, hash: null, message: "Creating governance proposal...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await createProposalOnChain(signer, campaignId, title, description, durationSeconds);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Governance proposal published on blockchain!",
+        error: null,
+      });
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed creating proposal";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Vote on Proposal
+  const voteOnProposal = async (proposalId, support) => {
+    setTxState({ loading: true, hash: null, message: `Submitting vote (${support ? "FOR" : "AGAINST"})...`, error: null });
+    try {
+      const signer = await getSigner();
+      const result = await voteOnProposalOnChain(signer, proposalId, support);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Your vote has been cast and verified on-chain!",
+        error: null,
+      });
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed casting vote";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Execute Proposal
+  const executeProposal = async (proposalId) => {
+    setTxState({ loading: true, hash: null, message: "Finalizing proposal results...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await executeProposalOnChain(signer, proposalId);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Proposal tally executed successfully!",
+        error: null,
+      });
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed executing proposal";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Raise Dispute
+  const raiseDispute = async (campaignId, milestoneIndex, reason, evidenceUrl) => {
+    setTxState({ loading: true, hash: null, message: "Submitting dispute to smart contract...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await raiseDisputeOnChain(signer, campaignId, milestoneIndex, reason, evidenceUrl);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: "Dispute registered on-chain. Milestone releases paused pending review.",
+        error: null,
+      });
+      await refreshCampaigns();
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed raising dispute";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
+  // Resolve Dispute (Admin)
+  const resolveDispute = async (disputeId, inFavorOfDonors, resolutionNotes) => {
+    setTxState({ loading: true, hash: null, message: "Resolving dispute on blockchain...", error: null });
+    try {
+      const signer = await getSigner();
+      const result = await resolveDisputeOnChain(signer, disputeId, inFavorOfDonors, resolutionNotes);
+      setTxState({
+        loading: false,
+        hash: result.txHash,
+        message: `Dispute #${disputeId} officially resolved!`,
+        error: null,
+      });
+      await refreshCampaigns();
+      return result;
+    } catch (err) {
+      const msg = err.reason || err.data?.message || err.message || "Failed resolving dispute";
+      setTxState({ loading: false, hash: null, message: "", error: msg });
+      throw err;
+    }
+  };
+
   const clearTxStatus = () => {
     setTxState({ loading: false, hash: null, message: "", error: null });
   };
@@ -476,7 +767,10 @@ export function Web3Provider({ children }) {
       value={{
         account,
         availableAccounts,
+        accountBalances,
         selectAccount,
+        getAccountName,
+        setCustomAccountName,
         adminAddress,
         isAdmin,
         chainId,
@@ -505,6 +799,15 @@ export function Web3Provider({ children }) {
         withdrawVaultDeposit,
         requestFaucet,
         fastForward,
+        submitMilestoneEvidence,
+        approveMilestone,
+        rejectMilestone,
+        releaseMilestoneFunds,
+        createProposal,
+        voteOnProposal,
+        executeProposal,
+        raiseDispute,
+        resolveDispute,
         getCampaignById,
         getContributionStatus,
         getUserVaultBalance,
@@ -512,6 +815,11 @@ export function Web3Provider({ children }) {
         getAllInteractingUsers,
         getAllContractEvents,
         getCampaignContributions,
+        getCampaignMilestones,
+        getCampaignProposals,
+        getCampaignDisputes,
+        getAllDisputes,
+        getCreatorReputation,
         isAddMoneyOpen,
         openAddMoneyModal: () => setIsAddMoneyOpen(true),
         closeAddMoneyModal: () => setIsAddMoneyOpen(false),

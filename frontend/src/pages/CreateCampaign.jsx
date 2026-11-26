@@ -1,8 +1,26 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { PlusCircle, Calendar, Coins, Image, Tag, FileText, AlertCircle, Sparkles, CheckCircle2, ArrowRight } from "lucide-react";
+import {
+  PlusCircle,
+  Calendar,
+  Coins,
+  Image,
+  Tag,
+  FileText,
+  AlertCircle,
+  Sparkles,
+  CheckCircle2,
+  ArrowRight,
+  ShieldAlert,
+  Bot,
+  Layers,
+  Trash2,
+  Plus,
+  Info,
+} from "lucide-react";
 import { useWeb3 } from "../context/Web3Context";
 import CampaignCard from "../components/CampaignCard";
+import { analyzeCampaign } from "../services/aiFraudDetector";
 
 const CATEGORIES = [
   "Agriculture",
@@ -44,7 +62,7 @@ const SAMPLE_IMAGE_PRESETS = [
 ];
 
 export default function CreateCampaign() {
-  const { isConnected, connectWallet, createCampaign, account } = useWeb3();
+  const { isConnected, connectWallet, createCampaign, account, campaigns } = useWeb3();
   const navigate = useNavigate();
 
   // Calculate default deadline: 14 days from now
@@ -62,6 +80,17 @@ export default function CreateCampaign() {
     beneficiary: "",
   });
 
+  // Milestones State
+  const [useMilestones, setUseMilestones] = useState(false);
+  const [milestones, setMilestones] = useState([
+    { title: "Stage 1: Equipment Procurement & Setup", targetAmount: "", description: "Procure certified solar equipment and deliver to village cooperative" },
+    { title: "Stage 2: Final Testing & Installation", targetAmount: "", description: "Complete on-site assembly, grid testing, and hand over to beneficiaries" },
+  ]);
+
+  // AI Fraud Detection state
+  const [aiAnalysis, setAiAnalysis] = useState(null);
+  const [analyzingAi, setAnalyzingAi] = useState(false);
+
   const [validationError, setValidationError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -78,6 +107,61 @@ export default function CreateCampaign() {
     setFormData((prev) => ({ ...prev, deadline: futureDate }));
   };
 
+  // Milestones helpers
+  const handleAddMilestone = () => {
+    if (milestones.length >= 5) return;
+    setMilestones((prev) => [
+      ...prev,
+      { title: `Stage ${prev.length + 1}: Deliverable`, targetAmount: "", description: "" },
+    ]);
+  };
+
+  const handleRemoveMilestone = (index) => {
+    setMilestones((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleMilestoneChange = (index, field, value) => {
+    setMilestones((prev) => {
+      const updated = [...prev];
+      updated[index][field] = value;
+      return updated;
+    });
+  };
+
+  const milestoneTotal = milestones.reduce(
+    (sum, m) => sum + (parseFloat(m.targetAmount) || 0),
+    0
+  );
+
+  // Run AI Risk Analysis
+  const runAiCheck = async () => {
+    if (!formData.title.trim() && !formData.description.trim()) {
+      setValidationError("Please enter at least a title or description to analyze.");
+      return;
+    }
+    setAnalyzingAi(true);
+    try {
+      const days = Math.max(
+        1,
+        Math.round((new Date(formData.deadline).getTime() - Date.now()) / (1000 * 60 * 60 * 24))
+      );
+      const res = await analyzeCampaign({
+        title: formData.title,
+        description: formData.description,
+        goal: parseFloat(formData.goalEth) || 1.0,
+        category: formData.category,
+        deadlineDays: days,
+        existingCampaigns: campaigns,
+      });
+      setAiAnalysis(res);
+    } catch (err) {
+      console.warn("AI analysis error:", err);
+    } finally {
+      setAnalyzingAi(false);
+    }
+  };
+
+  // Form submit
   const handleSubmit = async (e) => {
     e.preventDefault();
     setValidationError("");
@@ -113,16 +197,49 @@ export default function CreateCampaign() {
       return;
     }
 
+    // Milestones validation if enabled
+    let preparedMilestones = [];
+    if (useMilestones) {
+      if (milestones.length === 0) {
+        setValidationError("Please add at least one milestone or disable milestone payments.");
+        return;
+      }
+      for (let i = 0; i < milestones.length; i++) {
+        const m = milestones[i];
+        const amt = parseFloat(m.targetAmount);
+        if (!m.title.trim()) {
+          setValidationError(`Milestone #${i + 1} must have a title.`);
+          return;
+        }
+        if (isNaN(amt) || amt <= 0) {
+          setValidationError(`Milestone #${i + 1} must have a target amount > 0 ETH.`);
+          return;
+        }
+      }
+      if (Math.abs(milestoneTotal - goalNum) > 0.0001 && milestoneTotal > goalNum) {
+        setValidationError(
+          `Sum of milestone targets (${milestoneTotal.toFixed(3)} ETH) exceeds total campaign goal (${goalNum} ETH).`
+        );
+        return;
+      }
+      preparedMilestones = milestones.map((m) => ({
+        title: m.title.trim(),
+        description: m.description.trim() || m.title.trim(),
+        targetAmount: m.targetAmount.toString(),
+      }));
+    }
+
     setIsSubmitting(true);
     try {
       const result = await createCampaign({
         title: formData.title.trim(),
         description: formData.description.trim(),
-        goalEth: formData.goalEth,
-        deadlineTimestamp,
+        goal: formData.goalEth,
+        deadline: formData.deadline,
         category: formData.category,
         imageUrl: formData.imageUrl.trim(),
         beneficiary: formData.beneficiary.trim() || account,
+        milestones: preparedMilestones,
       });
 
       // Redirect to newly created campaign
@@ -163,13 +280,13 @@ export default function CreateCampaign() {
       <div className="border-b border-gray-200/80 pb-6">
         <div className="inline-flex items-center gap-2 px-3 py-1 bg-emerald-100 text-emerald-800 text-xs font-semibold rounded-full mb-3">
           <Sparkles className="w-3.5 h-3.5" />
-          <span>Launch on Ethereum Blockchain</span>
+          <span>FundChain 3.0 · Smart Contract Escrow & AI Verification</span>
         </div>
         <h1 className="text-3xl font-extrabold text-gray-900 tracking-tight">
           Create a New Campaign
         </h1>
         <p className="text-sm text-gray-600 mt-1 max-w-2xl">
-          Publish an immutable crowdfunding campaign to the smart contract. Funds are safely held in trust until your deadline passes.
+          Publish an immutable crowdfunding campaign with locked escrow, designated beneficiary routing, optional milestone-based releases, and built-in AI risk analysis.
         </p>
       </div>
 
@@ -223,9 +340,20 @@ export default function CreateCampaign() {
 
             {/* Description */}
             <div>
-              <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
-                Campaign Story & Description <span className="text-rose-500">*</span>
-              </label>
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider">
+                  Campaign Story & Deliverables <span className="text-rose-500">*</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={runAiCheck}
+                  disabled={analyzingAi}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 px-2.5 py-1 rounded-lg border border-emerald-200 transition-colors cursor-pointer"
+                >
+                  <Bot className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>{analyzingAi ? "Analyzing..." : "Run AI Fraud Check"}</span>
+                </button>
+              </div>
               <textarea
                 name="description"
                 rows={5}
@@ -237,12 +365,51 @@ export default function CreateCampaign() {
               />
             </div>
 
+            {/* AI Risk Score Feedback Box if generated */}
+            {aiAnalysis && (
+              <div
+                className={`p-4 rounded-2xl border text-xs space-y-2 animate-fade-in ${
+                  aiAnalysis.riskLevel === "HIGH"
+                    ? "bg-rose-50 border-rose-200 text-rose-900"
+                    : aiAnalysis.riskLevel === "MEDIUM"
+                    ? "bg-amber-50 border-amber-200 text-amber-900"
+                    : "bg-emerald-50 border-emerald-200 text-emerald-900"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-bold uppercase tracking-wider flex items-center gap-1.5">
+                    <Bot className="w-4 h-4" />
+                    AI Campaign Risk Assessment
+                  </span>
+                  <span
+                    className={`font-black px-2 py-0.5 rounded text-[11px] ${
+                      aiAnalysis.riskLevel === "HIGH"
+                        ? "bg-rose-200 text-rose-900"
+                        : aiAnalysis.riskLevel === "MEDIUM"
+                        ? "bg-amber-200 text-amber-900"
+                        : "bg-emerald-200 text-emerald-900"
+                    }`}
+                  >
+                    Risk Score: {aiAnalysis.riskScore}/100 ({aiAnalysis.riskLevel} RISK)
+                  </span>
+                </div>
+                <ul className="list-disc list-inside space-y-1 text-xs opacity-90">
+                  {aiAnalysis.reasons.map((r, i) => (
+                    <li key={i}>{r}</li>
+                  ))}
+                </ul>
+                <div className="text-[10px] text-gray-500 font-mono pt-1">
+                  Engine: {aiAnalysis.engine} · Confidence: {Math.round(aiAnalysis.confidence * 100)}%
+                </div>
+              </div>
+            )}
+
             {/* Goal and Deadline Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               {/* Goal */}
               <div>
                 <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
-                  Funding Goal (ETH) <span className="text-rose-500">*</span>
+                  Total Funding Goal (ETH) <span className="text-rose-500">*</span>
                 </label>
                 <div className="relative">
                   <input
@@ -292,6 +459,116 @@ export default function CreateCampaign() {
               </div>
             </div>
 
+            {/* MILESTONE-BASED RELEASE TOGGLE (Requirement #5) */}
+            <div className="bg-[#F8FAF7] p-4.5 rounded-2xl border border-gray-200 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-emerald-700" />
+                    <span className="text-xs font-bold text-gray-900 uppercase tracking-wider">
+                      Milestone-Based Fund Releases (Staged Payments)
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-gray-500 mt-0.5">
+                    Release collected escrow funds in tranches upon verified proof of project progress.
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useMilestones}
+                    onChange={(e) => setUseMilestones(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-hidden rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-700"></div>
+                </label>
+              </div>
+
+              {useMilestones && (
+                <div className="space-y-3 pt-3 border-t border-gray-200/80 animate-fade-in">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-gray-700">Define Milestone Tranches:</span>
+                    <span
+                      className={`font-bold ${
+                        milestoneTotal > parseFloat(formData.goalEth || 0)
+                          ? "text-rose-600"
+                          : "text-emerald-700"
+                      }`}
+                    >
+                      Sum: {milestoneTotal.toFixed(3)} ETH / Goal: {formData.goalEth || "0"} ETH
+                    </span>
+                  </div>
+
+                  {milestones.map((m, idx) => (
+                    <div
+                      key={idx}
+                      className="p-3 bg-white rounded-xl border border-gray-200 space-y-2 relative group"
+                    >
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-bold text-gray-800">
+                          Milestone #{idx + 1}
+                        </span>
+                        {milestones.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveMilestone(idx)}
+                            className="text-gray-400 hover:text-rose-600 p-1"
+                            title="Remove Milestone"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <input
+                          type="text"
+                          placeholder="Milestone title..."
+                          value={m.title}
+                          onChange={(e) => handleMilestoneChange(idx, "title", e.target.value)}
+                          className="sm:col-span-2 px-3 py-1.5 text-xs bg-[#F8FAF7] border border-gray-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-emerald-500 font-medium"
+                        />
+                        <div className="relative">
+                          <input
+                            type="number"
+                            step="0.01"
+                            placeholder="Amount..."
+                            value={m.targetAmount}
+                            onChange={(e) =>
+                              handleMilestoneChange(idx, "targetAmount", e.target.value)
+                            }
+                            className="w-full px-3 py-1.5 pr-8 text-xs bg-[#F8FAF7] border border-gray-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-emerald-500 font-bold text-emerald-800"
+                          />
+                          <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] font-bold text-gray-400">
+                            ETH
+                          </span>
+                        </div>
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="Deliverable description & verification criteria..."
+                        value={m.description}
+                        onChange={(e) =>
+                          handleMilestoneChange(idx, "description", e.target.value)
+                        }
+                        className="w-full px-3 py-1.5 text-xs bg-[#F8FAF7] border border-gray-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-emerald-500"
+                      />
+                    </div>
+                  ))}
+
+                  {milestones.length < 5 && (
+                    <button
+                      type="button"
+                      onClick={handleAddMilestone}
+                      className="w-full py-2 bg-white hover:bg-emerald-50 border border-dashed border-gray-300 hover:border-emerald-300 rounded-xl text-xs font-bold text-emerald-700 flex items-center justify-center gap-1.5 transition-colors"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Add Next Milestone ({milestones.length}/5)</span>
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Beneficiary Wallet Address */}
             <div>
               <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
@@ -306,7 +583,7 @@ export default function CreateCampaign() {
                 className="w-full px-4 py-3 bg-[#F8FAF7] border border-gray-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 transition-all"
               />
               <p className="text-[11px] text-gray-500 mt-1">
-                The smart contract escrow will disburse the collected funds directly to this beneficiary address upon successful goal completion.
+                The smart contract escrow will disburse the collected funds directly to this beneficiary address upon successful goal completion or approved milestones.
               </p>
             </div>
 

@@ -240,13 +240,44 @@ export async function switchNetwork(targetChainId = CHAIN_ID) {
 }
 
 /**
+ * Helper to fetch the current on-chain block timestamp (supports EVM fast-forward)
+ */
+export async function getLatestChainTimestamp(contract = null) {
+  try {
+    if (CHAIN_ID === 31337) {
+      const localBlock = await getReadOnlyProvider().getBlock("latest");
+      if (localBlock && localBlock.timestamp) return Number(localBlock.timestamp);
+    }
+    const prov = contract?.runner?.provider || getReadOnlyProvider();
+    const block = await prov.getBlock("latest");
+    if (block && block.timestamp) return Number(block.timestamp);
+  } catch {
+    // Fallback to browser clock
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Fetch exact live ETH balance for any address directly from the active blockchain node
+ */
+export async function getAddressBalance(address) {
+  if (!address) return "0.000000";
+  const prov = CHAIN_ID === 31337 ? getReadOnlyProvider() : (getBrowserProvider() || getReadOnlyProvider());
+  const balWei = await prov.getBalance(address);
+  return ethers.formatEther(balWei);
+}
+
+/**
  * Read function: Fetch all campaigns
  */
 export async function getAllCampaigns(provider = null) {
   try {
     const contract = await getContract(provider);
-    const campaigns = await contract.getAllCampaigns();
-    return campaigns.map(formatCampaignData);
+    const [campaigns, chainNow] = await Promise.all([
+      contract.getAllCampaigns(),
+      getLatestChainTimestamp(contract),
+    ]);
+    return campaigns.map((c) => formatCampaignData(c, chainNow));
   } catch (error) {
     console.warn("Could not fetch campaigns from contract:", error.message);
     return [];
@@ -258,8 +289,11 @@ export async function getAllCampaigns(provider = null) {
  */
 export async function getCampaignById(campaignId, provider = null) {
   const contract = await getContract(provider);
-  const campaign = await contract.getCampaign(campaignId);
-  return formatCampaignData(campaign);
+  const [campaign, chainNow] = await Promise.all([
+    contract.getCampaign(campaignId),
+    getLatestChainTimestamp(contract),
+  ]);
+  return formatCampaignData(campaign, chainNow);
 }
 
 /**
@@ -362,52 +396,76 @@ export async function getAllInteractingUsers(provider = null) {
 
 /**
  * Fast-forward local EVM blockchain time (for testing campaign deadlines)
+ * Sends Hardhat JSON-RPC commands directly to local node since MetaMask blocks evm_* methods.
  */
 export async function fastForwardTime(seconds) {
-  if (typeof window === "undefined" || !window.ethereum) {
-    throw new Error("MetaMask or Web3 provider not detected");
+  const secs = Math.round(Number(seconds));
+  if (!Number.isFinite(secs) || secs <= 0) {
+    throw new Error("Invalid time increment specified.");
   }
+  const localRpc = getReadOnlyProvider();
   try {
-    await window.ethereum.request({
-      method: "evm_increaseTime",
-      params: [seconds],
-    });
-    await window.ethereum.request({
-      method: "evm_mine",
-      params: [],
-    });
+    await localRpc.send("evm_increaseTime", [secs]);
+    await localRpc.send("evm_mine", []);
     return true;
   } catch (err) {
     console.warn("Failed fast forwarding EVM time:", err);
-    throw err;
+    throw new Error(
+      err?.code === "NETWORK_ERROR" || err?.message?.includes("fetch")
+        ? "Cannot reach local Hardhat node at http://127.0.0.1:8545."
+        : err?.reason || err?.message || "EVM time fast-forward is only supported on a local Hardhat node."
+    );
   }
 }
 
 /**
- * Write function: Create a new campaign with optional designated beneficiary
+ * Write function: Create a new campaign with optional milestones and designated beneficiary
  */
-export async function createCampaignOnChain(
-  signer,
-  { title, description, goalEth, deadlineTimestamp, category, imageUrl, beneficiary }
-) {
+export async function createCampaignOnChain(signer, campaignData) {
   if (!signer) throw new Error("Wallet not connected");
-  const contract = new ethers.Contract(CONTRACT_ADDRESS, CrowdfundingABI, signer);
-  const goalInWei = ethers.parseEther(goalEth.toString());
-  
-  const signerAddress = await signer.getAddress();
-  const beneficiaryAddress = beneficiary && ethers.isAddress(beneficiary) ? beneficiary : signerAddress;
+  const contract = await getContract(signer);
+  const goalWei = ethers.parseEther(campaignData.goalEth || campaignData.goal || "0");
+  const deadlineTimestamp = typeof campaignData.deadlineTimestamp === "number"
+    ? campaignData.deadlineTimestamp
+    : Math.floor(new Date(campaignData.deadline).getTime() / 1000);
 
-  const tx = await contract["createCampaign(string,string,uint256,uint256,string,string,address)"](
-    title,
-    description,
-    goalInWei,
-    deadlineTimestamp,
-    category,
-    imageUrl || "",
-    beneficiaryAddress
-  );
+  const signerAddress = await signer.getAddress();
+  const beneficiaryAddr = campaignData.beneficiary && ethers.isAddress(campaignData.beneficiary)
+    ? campaignData.beneficiary.trim()
+    : signerAddress;
+
+  let tx;
+  if (campaignData.milestones && campaignData.milestones.length > 0) {
+    const titles = campaignData.milestones.map((m) => m.title);
+    const descriptions = campaignData.milestones.map((m) => m.description || m.title);
+    const targets = campaignData.milestones.map((m) => ethers.parseEther(m.targetAmount || "0"));
+
+    tx = await contract.createCampaignWithMilestones(
+      campaignData.title,
+      campaignData.description,
+      goalWei,
+      deadlineTimestamp,
+      campaignData.category,
+      campaignData.imageUrl || "",
+      beneficiaryAddr,
+      titles,
+      descriptions,
+      targets
+    );
+  } else {
+    tx = await contract["createCampaign(string,string,uint256,uint256,string,string,address)"](
+      campaignData.title,
+      campaignData.description,
+      goalWei,
+      deadlineTimestamp,
+      campaignData.category,
+      campaignData.imageUrl || "",
+      beneficiaryAddr
+    );
+  }
+
   const receipt = await tx.wait();
-  
+
   let newCampaignId = null;
   for (const log of receipt.logs) {
     try {
@@ -721,10 +779,233 @@ export async function getCampaignContributions(campaignId, provider = null) {
   }
 }
 
+
+/**
+ * Fetch milestones for a campaign
+ */
+export async function getCampaignMilestones(campaignId, provider = null) {
+  try {
+    const contract = await getContract(provider);
+    const raw = await contract.getCampaignMilestones(campaignId);
+    return raw.map((m) => ({
+      id: Number(m.id),
+      title: m.title,
+      description: m.description,
+      targetAmount: ethers.formatEther(m.targetAmount),
+      completed: Boolean(m.completed),
+      approved: Boolean(m.approved),
+      released: Boolean(m.released),
+      evidenceUrl: m.evidenceUrl || "",
+      submittedAt: Number(m.submittedAt),
+      approvedAt: Number(m.approvedAt),
+    }));
+  } catch (err) {
+    console.warn("Could not query milestones:", err);
+    return [];
+  }
+}
+
+/**
+ * Submit milestone evidence by creator
+ */
+export async function submitMilestoneEvidenceOnChain(signer, campaignId, milestoneIndex, evidenceUrl) {
+  const contract = await getContract(signer);
+  const tx = await contract.submitMilestoneEvidence(campaignId, milestoneIndex, evidenceUrl);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Admin approves milestone
+ */
+export async function approveMilestoneOnChain(signer, campaignId, milestoneIndex) {
+  const contract = await getContract(signer);
+  const tx = await contract.approveMilestone(campaignId, milestoneIndex);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Admin rejects milestone
+ */
+export async function rejectMilestoneOnChain(signer, campaignId, milestoneIndex, reason) {
+  const contract = await getContract(signer);
+  const tx = await contract.rejectMilestone(campaignId, milestoneIndex, reason);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Release approved milestone funds to beneficiary
+ */
+export async function releaseMilestoneFundsOnChain(signer, campaignId, milestoneIndex) {
+  const contract = await getContract(signer);
+  const tx = await contract.releaseMilestoneFunds(campaignId, milestoneIndex);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Create donor voting proposal
+ */
+export async function createProposalOnChain(signer, campaignId, title, description, durationSeconds = 86400 * 3) {
+  const contract = await getContract(signer);
+  const tx = await contract.createProposal(campaignId, title, description, durationSeconds);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Vote on a proposal
+ */
+export async function voteOnProposalOnChain(signer, proposalId, support) {
+  const contract = await getContract(signer);
+  const tx = await contract.voteOnProposal(proposalId, support);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Execute proposal after deadline
+ */
+export async function executeProposalOnChain(signer, proposalId) {
+  const contract = await getContract(signer);
+  const tx = await contract.executeProposal(proposalId);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Get proposals for a campaign
+ */
+export async function getCampaignProposals(campaignId, provider = null) {
+  try {
+    const contract = await getContract(provider);
+    const [raw, chainNow] = await Promise.all([
+      contract.getCampaignProposals(campaignId),
+      getLatestChainTimestamp(contract),
+    ]);
+    return raw.map((p) => ({
+      id: Number(p.id),
+      campaignId: Number(p.campaignId),
+      title: p.title,
+      description: p.description,
+      votesFor: Number(p.votesFor),
+      votesAgainst: Number(p.votesAgainst),
+      deadline: Number(p.deadline),
+      executed: Boolean(p.executed),
+      passed: Boolean(p.passed),
+      proposer: p.proposer,
+      isExpired: chainNow >= Number(p.deadline),
+    }));
+  } catch (err) {
+    console.warn("Could not query proposals:", err);
+    return [];
+  }
+}
+
+/**
+ * Raise a dispute
+ */
+export async function raiseDisputeOnChain(signer, campaignId, milestoneIndex, reason, evidenceUrl = "") {
+  const contract = await getContract(signer);
+  const tx = await contract.raiseDispute(campaignId, milestoneIndex, reason, evidenceUrl);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Resolve a dispute (Admin only)
+ */
+export async function resolveDisputeOnChain(signer, disputeId, inFavorOfDonors, resolutionNotes) {
+  const contract = await getContract(signer);
+  const tx = await contract.resolveDispute(disputeId, inFavorOfDonors, resolutionNotes);
+  const receipt = await tx.wait();
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Get disputes for a campaign
+ */
+export async function getCampaignDisputes(campaignId, provider = null) {
+  try {
+    const contract = await getContract(provider);
+    const raw = await contract.getCampaignDisputes(campaignId);
+    return raw.map((d) => ({
+      id: Number(d.id),
+      campaignId: Number(d.campaignId),
+      milestoneIndex: Number(d.milestoneIndex),
+      complainant: d.complainant,
+      reason: d.reason,
+      evidenceUrl: d.evidenceUrl,
+      createdAt: Number(d.createdAt),
+      resolved: Boolean(d.resolved),
+      inFavorOfDonors: Boolean(d.inFavorOfDonors),
+      resolutionNotes: d.resolutionNotes || "",
+    }));
+  } catch (err) {
+    console.warn("Could not query campaign disputes:", err);
+    return [];
+  }
+}
+
+/**
+ * Get all disputes across platform
+ */
+export async function getAllDisputes(provider = null) {
+  try {
+    const contract = await getContract(provider);
+    const raw = await contract.getAllDisputes();
+    return raw.map((d) => ({
+      id: Number(d.id),
+      campaignId: Number(d.campaignId),
+      milestoneIndex: Number(d.milestoneIndex),
+      complainant: d.complainant,
+      reason: d.reason,
+      evidenceUrl: d.evidenceUrl,
+      createdAt: Number(d.createdAt),
+      resolved: Boolean(d.resolved),
+      inFavorOfDonors: Boolean(d.inFavorOfDonors),
+      resolutionNotes: d.resolutionNotes || "",
+    }));
+  } catch (err) {
+    console.warn("Could not query all disputes:", err);
+    return [];
+  }
+}
+
+/**
+ * Query verifiable on-chain reputation for a creator address
+ */
+export async function getCreatorReputation(creatorAddress, provider = null) {
+  try {
+    const contract = await getContract(provider);
+    const raw = await contract.getCreatorReputation(creatorAddress);
+    return {
+      score: Number(raw[0]),
+      totalCreated: Number(raw[1]),
+      successfulCampaigns: Number(raw[2]),
+      milestonesCompleted: Number(raw[3]),
+      disputesAgainst: Number(raw[4]),
+      badge: raw[5] || "New Creator",
+    };
+  } catch (err) {
+    console.warn("Could not query creator reputation:", err);
+    return {
+      score: 75,
+      totalCreated: 0,
+      successfulCampaigns: 0,
+      milestonesCompleted: 0,
+      disputesAgainst: 0,
+      badge: "New Creator",
+    };
+  }
+}
+
 /**
  * Helper to structure Campaign struct into clean JavaScript object with accurate Escrow statuses
  */
-export function formatCampaignData(c) {
+export function formatCampaignData(c, chainTimestamp = null) {
   const goalEth = ethers.formatEther(c.goal || 0);
   const raisedEth = ethers.formatEther(c.amountRaised || 0);
   const escrowEth = ethers.formatEther(c.escrowBalance || 0);
@@ -732,7 +1013,7 @@ export function formatCampaignData(c) {
   const refundedEth = ethers.formatEther(c.totalRefunded || 0);
 
   const deadlineNum = Number(c.deadline);
-  const now = Math.floor(Date.now() / 1000);
+  const now = chainTimestamp || Math.floor(Date.now() / 1000);
 
   const goalFloat = parseFloat(goalEth);
   const raisedFloat = parseFloat(raisedEth);
@@ -784,6 +1065,7 @@ export function formatCampaignData(c) {
     totalReleased: releasedEth,
     totalRefunded: refundedEth,
     deadline: deadlineNum,
+    chainTimestamp: now,
     createdAt: Number(c.createdAt || (deadlineNum - 86400 * 14)),
     category: c.category || "General",
     imageUrl: c.imageUrl || "",

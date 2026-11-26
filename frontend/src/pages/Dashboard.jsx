@@ -45,8 +45,19 @@ export default function Dashboard() {
     refreshCampaigns,
     openAddMoneyModal,
     getAllContractEvents,
+    getAccountName,
+    setCustomAccountName,
+    getCreatorReputation,
     chainId,
   } = useWeb3();
+
+  const [creatorReputation, setCreatorReputation] = useState(null);
+
+  useEffect(() => {
+    if (account && getCreatorReputation) {
+      getCreatorReputation(account).then((rep) => setCreatorReputation(rep)).catch(() => {});
+    }
+  }, [account, getCreatorReputation]);
 
   const [supportedCampaigns, setSupportedCampaigns] = useState([]);
   const [loadingSupported, setLoadingSupported] = useState(false);
@@ -285,9 +296,16 @@ export default function Dashboard() {
             <LayoutDashboard className="w-3.5 h-3.5" />
             <span>Connected Portfolio</span>
           </div>
-          <h1 className="text-2xl sm:text-3xl font-black text-gray-900 tracking-tight">
-            User Dashboard
-          </h1>
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-2xl sm:text-3xl font-black text-gray-900 tracking-tight">
+              {getAccountName ? getAccountName(account) : "User Dashboard"}
+            </h1>
+            {creatorReputation && (
+              <span className="text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 px-2.5 py-1 rounded-full">
+                Reputation: {creatorReputation.score}/100 ({creatorReputation.badge})
+              </span>
+            )}
+          </div>
           <div className="flex items-center gap-2 text-xs font-mono text-gray-600 bg-gray-50 px-3 py-1.5 rounded-xl border border-gray-200 w-fit">
             <span>{shortenAddress(account)}</span>
             <button
